@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: spring-ai-agent
+  ai:
+    dashscope:
+      # 阿里云 DashScope API Key，请替换为你的实际 API Key
+      api-key: '{put u key here}'
+      chat:
+        options:
+          # 使用的模型，可选: qwen-turbo, qwen-plus, qwen-max
+          model: qwen-max
+          temperature: 0.7
+
+server:
+  port: 8080
+
+# Milvus 向量数据库配置
+milvus:
+  enabled: false  # 默认关闭，需要使用 RAG 功能时设置为 true 并启动 Milvus
+  host: localhost
+  port: 19530
+
+logging:
+  level:
+    com.tes.springai: INFO
+    org.springframework.ai: DEBUG
