@@ -8,8 +8,9 @@ spring:
       max-request-size: 15MB
   ai:
     zhipuai:
-      # api-key 使用你自己申请的进行替换；如果为了安全考虑，可以通过启动参数进行设置
-      api-key: ${zhipuai-api-key}
+      # API Key 从项目根目录 .env 读取（DotenvEnvironmentPostProcessor 加载，优先级高于系统环境变量）；
+      # 兼容旧启动参数 -Dzhipuai-api-key=xxx；均未配置时为空，调用时返回明确的鉴权错误
+      api-key: ${ZHIPUAI_API_KEY:${zhipuai-api-key:}}
       chat:
         options:
           model: glm-5.3-flash

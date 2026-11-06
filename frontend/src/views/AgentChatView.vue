@@ -48,7 +48,7 @@
                   <ThunderboltOutlined /> MCP 工具
                 </a-tag>
                 <a-tag v-if="currentAgent.enableImageUpload" color="orange">
-                  <PictureOutlined /> 图片对话
+                  <PaperClipOutlined /> 附件对话
                 </a-tag>
                 <a-tag v-if="currentAgent.knowledgeBaseId" color="purple">
                   <BookOutlined /> 知识库支持
@@ -68,18 +68,29 @@
             {{ msg.role === 'user' ? '👤' : currentAgent?.avatar || '🤖' }}
           </a-avatar>
           <div class="message-bubble">
-            <div class="message-images" v-if="msg.images && msg.images.length">
+            <div class="message-attachments" v-if="msg.attachments && msg.attachments.length">
               <a-image-preview-group>
                 <a-image
-                  v-for="(fileId, imgIndex) in msg.images"
-                  :key="imgIndex"
-                  :src="attachmentApi.attachmentUrl(fileId)"
+                  v-for="att in imageAttachments(msg)"
+                  :key="att.fileId"
+                  :src="attachmentApi.attachmentUrl(att.fileId)"
                   :fallback="IMAGE_FALLBACK"
                   :width="120"
                   :height="90"
                   class="message-image"
                 />
               </a-image-preview-group>
+              <a
+                v-for="att in documentAttachments(msg)"
+                :key="att.fileId"
+                class="message-doc-chip"
+                :href="attachmentApi.attachmentUrl(att.fileId)"
+                target="_blank"
+                rel="noopener"
+              >
+                <FileTextOutlined />
+                <span class="doc-chip-name">{{ att.fileName }}</span>
+              </a>
             </div>
             <div class="message-text" v-if="msg.content">{{ msg.content }}</div>
             <div class="message-time">
@@ -105,27 +116,31 @@
 
       <!-- 输入区 -->
       <div class="input-area">
-        <!-- 已上传图片暂存区（一行展示，点击可预览） -->
-        <div class="pending-images" v-if="imageUploadEnabled && pendingImages.length > 0">
-          <div v-for="img in pendingImages" :key="img.key" class="pending-image-item">
-            <div class="pending-image-thumb">
-              <a-spin v-if="img.uploading" size="small" />
+        <!-- 已上传附件暂存区（图片缩略图 / 文档文件名，一行展示） -->
+        <div class="pending-images" v-if="attachmentEnabled && pendingAttachments.length > 0">
+          <div v-for="att in pendingAttachments" :key="att.key" class="pending-image-item">
+            <div class="pending-image-thumb" :title="att.fileName">
+              <a-spin v-if="att.uploading" size="small" />
               <a-image
-                v-else
-                :src="img.url"
+                v-else-if="att.isImage"
+                :src="att.url"
                 :fallback="IMAGE_FALLBACK"
                 :width="72"
                 :height="72"
                 class="pending-image-img"
               />
+              <div v-else class="pending-doc-chip">
+                <FileTextOutlined class="doc-chip-icon" />
+                <span class="doc-chip-name">{{ att.fileName }}</span>
+              </div>
             </div>
             <a-button
-              v-if="!img.uploading"
+              v-if="!att.uploading"
               size="small"
               shape="circle"
               danger
               class="pending-image-remove"
-              @click="removeImage(img)"
+              @click="removeAttachment(att)"
             >
               <template #icon><CloseOutlined /></template>
             </a-button>
@@ -143,15 +158,15 @@
         />
         <div class="input-buttons">
           <a-upload
-            v-if="imageUploadEnabled"
-            accept="image/jpeg,image/png,image/gif,image/webp"
+            v-if="attachmentEnabled"
+            :accept="UPLOAD_ACCEPT"
             :show-upload-list="false"
             :before-upload="handleUploadSelect"
-            :disabled="isLoading || pendingImages.length >= MAX_IMAGE_COUNT"
+            :disabled="isLoading || pendingAttachments.length >= MAX_ATTACHMENT_COUNT"
           >
-            <a-tooltip title="上传图片（单张 ≤10MB，最多 5 张，支持直接粘贴）">
+            <a-tooltip title="上传附件（图片/PDF/Word/TXT，单个 ≤10MB，最多 5 个）">
               <a-button size="large" class="upload-button">
-                <template #icon><PictureOutlined /></template>
+                <template #icon><PaperClipOutlined /></template>
               </a-button>
             </a-tooltip>
           </a-upload>
@@ -191,13 +206,24 @@
               <span class="history-role">{{ msg.role === 'user' ? '我' : currentAgent?.name || 'AI' }}</span>
               <span class="history-time">{{ formatTime(msg.timestamp) }}</span>
             </div>
-            <div class="history-images" v-if="msg.images && msg.images.length">
+            <div class="history-images" v-if="msg.attachments && msg.attachments.length">
               <img
-                v-for="(fileId, imgIndex) in msg.images"
-                :key="imgIndex"
-                :src="attachmentApi.attachmentUrl(fileId)"
+                v-for="att in imageAttachments(msg)"
+                :key="att.fileId"
+                :src="attachmentApi.attachmentUrl(att.fileId)"
                 class="history-image"
               />
+              <a
+                v-for="att in documentAttachments(msg)"
+                :key="att.fileId"
+                class="message-doc-chip context-doc-chip"
+                :href="attachmentApi.attachmentUrl(att.fileId)"
+                target="_blank"
+                rel="noopener"
+              >
+                <FileTextOutlined />
+                <span class="doc-chip-name">{{ att.fileName }}</span>
+              </a>
             </div>
             <div class="history-content" v-if="msg.content">{{ msg.content }}</div>
           </div>
@@ -219,13 +245,14 @@ import {
   LoadingOutlined,
   HistoryOutlined,
   ThunderboltOutlined,
-  PictureOutlined,
+  PaperClipOutlined,
+  FileTextOutlined,
   CloseOutlined,
   BookOutlined
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import { chatApi, agentApi, attachmentApi } from '../api'
-import { useImageUpload, MAX_IMAGE_COUNT, IMAGE_FALLBACK } from '../composables/useImageUpload'
+import { useAttachmentUpload, MAX_ATTACHMENT_COUNT, UPLOAD_ACCEPT, IMAGE_FALLBACK } from '../composables/useAttachmentUpload'
 
 const route = useRoute()
 const router = useRouter()
@@ -238,33 +265,37 @@ const sessionId = ref(null)
 const messagesContainer = ref(null)
 const showHistoryDrawer = ref(false)
 
-// 图片上传能力：跟随 Agent 的功能配置
-const imageUploadEnabled = computed(() => !!currentAgent.value?.enableImageUpload)
+// 附件上传能力：跟随 Agent 的功能配置
+const attachmentEnabled = computed(() => !!currentAgent.value?.enableImageUpload)
 
 const {
-  pendingImages,
+  pendingAttachments,
   uploadingCount,
-  hasReadyImages,
-  removeImage,
+  hasReadyAttachments,
+  removeAttachment,
   handlePaste,
   handleUploadSelect,
   getFileIds,
-  restoreImages,
-  clear: clearPendingImages
-} = useImageUpload(imageUploadEnabled)
+  restoreAttachments,
+  clear: clearAttachments
+} = useAttachmentUpload(attachmentEnabled)
+
+// 气泡/历史抽屉中的附件渲染：图片走缩略图，文档走文件名链接
+const imageAttachments = (msg) => (msg.attachments || []).filter(att => att.isImage)
+const documentAttachments = (msg) => (msg.attachments || []).filter(att => !att.isImage)
 
 // 输入框占位文案
 const inputPlaceholder = computed(() =>
-  imageUploadEnabled.value
+  attachmentEnabled.value
     ? '输入消息... (Enter 发送, Shift+Enter 换行，可直接粘贴图片)'
     : '输入消息... (Enter 发送, Shift+Enter 换行)'
 )
 
-// 发送按钮禁用条件：加载中/图片上传中；无文字且无可发送图片
+// 发送按钮禁用条件：加载中/附件上传中；无文字且无可发送附件
 const sendDisabled = computed(() => {
   if (isLoading.value || uploadingCount.value > 0) return true
   const hasText = inputMessage.value.trim().length > 0
-  return !(hasText || hasReadyImages.value)
+  return !(hasText || hasReadyAttachments.value)
 })
 
 // 生成会话ID
@@ -297,7 +328,7 @@ const handleEnter = (e) => {
 const sendMessage = async () => {
   if (sendDisabled.value) return
   if (uploadingCount.value > 0) {
-    message.warning('图片上传中，请稍候')
+    message.warning('附件上传中，请稍候')
     return
   }
 
@@ -305,19 +336,22 @@ const sendMessage = async () => {
   const fileIds = getFileIds()
   const userMsgIndex = messages.value.length
 
+  // 发送前保存暂存条目快照：用于气泡展示与发送失败后的恢复
+  const savedAttachments = pendingAttachments.value.map(item => ({ ...item }))
+
   // 清空输入框（立即清空）
   inputMessage.value = ''
 
-  // 添加用户消息（含图片附件）
+  // 添加用户消息（含附件）
   messages.value.push({
     role: 'user',
     content: userMessage,
-    images: fileIds,
+    attachments: savedAttachments.filter(item => item.fileId),
     timestamp: Date.now()
   })
 
-  // 清空图片暂存区
-  clearPendingImages()
+  // 清空附件暂存区
+  clearAttachments()
 
   // 滚动到底部
   await nextTick()
@@ -359,7 +393,7 @@ const sendMessage = async () => {
     // 撤回未送达的用户消息，恢复输入与附件便于重试
     messages.value.splice(userMsgIndex, 1)
     inputMessage.value = userMessage
-    restoreImages(fileIds)
+    restoreAttachments(savedAttachments)
     messages.value.push({
       role: 'assistant',
       content: '抱歉，发送消息时出现错误: ' + (error.response?.data?.error || error.message),
@@ -742,6 +776,55 @@ onMounted(async () => {
   object-fit: cover;
   border-radius: 6px;
   border: 1px solid #e8e8e8;
+}
+
+/* 暂存区中的文档附件 */
+.pending-doc-chip {
+  width: 72px;
+  height: 72px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: #fafafa;
+}
+
+.pending-doc-chip .doc-chip-icon {
+  font-size: 20px;
+  color: #667eea;
+}
+
+/* 消息气泡/历史抽屉中的文档附件 */
+.message-doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #e8e8e8;
+  background: white;
+  color: #333;
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.message-doc-chip:hover {
+  border-color: #667eea;
+  color: #667eea;
+}
+
+.doc-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-doc-chip {
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .message-input {

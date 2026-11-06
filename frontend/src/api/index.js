@@ -37,8 +37,8 @@ export const chatApi = {
 
 // 附件 API
 export const attachmentApi = {
-  // 上传图片附件
-  uploadImage(file) {
+  // 上传附件（图片或 PDF/Word/TXT 文档）
+  uploadAttachment(file) {
     const formData = new FormData()
     formData.append('file', file)
 
@@ -54,7 +54,7 @@ export const attachmentApi = {
     return api.delete(`/api/attachment/${fileId}`)
   },
 
-  // 附件访问地址（供 <img> 直接展示与历史回显）
+  // 附件访问地址（供 <img> 直接展示、文档在线查看与历史回显）
   attachmentUrl(fileId) {
     return `${API_BASE_URL}/api/attachment/${fileId}`
   }

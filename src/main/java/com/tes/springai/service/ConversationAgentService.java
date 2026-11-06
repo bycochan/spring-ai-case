@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 /**
@@ -133,9 +134,9 @@ public class ConversationAgentService {
         // 检查是否为新会话
         boolean isNewSession = !sessionHistories.containsKey(sessionId);
 
-        // 获取或创建会话历史
+        // 获取或创建会话历史（同一会话并发请求需线程安全，避免并发修改导致历史错乱）
         List<HistoryEntry> history = sessionHistories.computeIfAbsent(sessionId, k -> {
-            List<HistoryEntry> newHistory = new ArrayList<>();
+            List<HistoryEntry> newHistory = new CopyOnWriteArrayList<>();
             // 添加系统提示词
             String systemPrompt = finalAgent.getSystemPrompt();
 
@@ -155,28 +156,42 @@ public class ConversationAgentService {
             return newHistory;
         });
 
+        // 校验用户消息非空：空白消息会让模型端 UserMessage 构造直接抛异常（500）
+        if (userMessage == null || userMessage.isBlank()) {
+            throw new IllegalArgumentException("消息内容不能为空");
+        }
+
         // 将用户消息（含附件引用）记入会话历史
-        history.add(new HistoryEntry("user", userMessage,
-                chatAttachments.stream().map(Attachment::getFileId).collect(Collectors.toList())));
+        HistoryEntry userEntry = new HistoryEntry("user", userMessage,
+                chatAttachments.stream().map(Attachment::getFileId).collect(Collectors.toList()));
+        history.add(userEntry);
 
         // 如果指定了知识库，使用 RAG
         String assistantResponse;
-        if (knowledgeBaseId != null && !knowledgeBaseId.isEmpty()) {
-            log.info("使用知识库: {}", knowledgeBaseId);
-            assistantResponse = ragService.ragQueryWithKnowledgeBase(userMessage, knowledgeBaseId, 3);
-        } else {
-            log.info("会话 {} 收到用户消息: {} (附件 {} 个)", sessionId, userMessage, chatAttachments.size());
+        try {
+            if (knowledgeBaseId != null && !knowledgeBaseId.isEmpty()) {
+                log.info("使用知识库: {}", knowledgeBaseId);
+                assistantResponse = ragService.ragQueryWithKnowledgeBase(userMessage, knowledgeBaseId, 3);
+            } else {
+                log.info("会话 {} 收到用户消息: {} (附件 {} 个)", sessionId, userMessage, chatAttachments.size());
 
-            // 由历史条目构建 Prompt（按需重建多模态 Media）并调用 AI 模型
-            Prompt prompt = new Prompt(buildMessages(history));
-            org.springframework.ai.chat.model.ChatResponse response = chatModel.call(prompt);
-            AssistantMessage assistantMsg = (AssistantMessage) response.getResult().getOutput();
-            assistantResponse = assistantMsg.getText();
+                // 由历史条目构建 Prompt（按需重建多模态 Media）并调用 AI 模型
+                Prompt prompt = new Prompt(buildMessages(history));
+                assistantResponse = callModelAndExtractText(prompt);
 
-            // 如果启用 MCP 且回复包含工具调用，执行工具
-            if ((agent.isEnableMCP() || enableMCP) && assistantResponse != null) {
-                assistantResponse = handleToolCall(assistantResponse, history, sessionId);
+                // 如果启用 MCP 且回复包含工具调用，执行工具
+                if ((agent.isEnableMCP() || enableMCP) && assistantResponse != null) {
+                    assistantResponse = handleToolCall(assistantResponse, history, sessionId);
+                }
             }
+        } catch (Exception e) {
+            // 调用失败：回滚刚记入的用户消息，避免历史中残留无回复的脏数据导致后续轮次错乱
+            history.remove(userEntry);
+            if (e instanceof IllegalArgumentException) {
+                throw e;
+            }
+            String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            throw new IllegalStateException("AI 服务调用失败，请稍后重试: " + detail, e);
         }
 
         // 将 AI 回复记入会话历史（RAG 分支也统一记录，保证多轮上下文与历史回显一致）
@@ -244,7 +259,9 @@ public class ConversationAgentService {
             switch (entry.role()) {
                 case "system" -> messages.add(new SystemMessage(entry.content()));
                 case "user" -> messages.add(buildUserMessage(entry));
-                case "assistant" -> messages.add(new AssistantMessage(entry.content()));
+                // AssistantMessage 不接受空白文本，历史中的空回复用占位文本兜底，避免后续轮次 500
+                case "assistant" -> messages.add(new AssistantMessage(
+                        entry.content() == null || entry.content().isBlank() ? "（空回复）" : entry.content()));
                 default -> log.warn("会话历史中存在未知角色消息，已跳过: {}", entry.role());
             }
         }
@@ -336,6 +353,9 @@ public class ConversationAgentService {
 
                     @SuppressWarnings("unchecked")
                     Map<String, Object> toolCall = gson.fromJson(jsonPart, Map.class);
+                    if (toolCall == null) {
+                        return response;
+                    }
 
                     String toolName = (String) toolCall.get("tool");
                     @SuppressWarnings("unchecked")
@@ -366,9 +386,7 @@ public class ConversationAgentService {
 
                             // 再次调用 AI 获取最终回复
                             Prompt prompt = new Prompt(buildMessages(history));
-                            org.springframework.ai.chat.model.ChatResponse aiResponse = chatModel.call(prompt);
-                            AssistantMessage assistantMsg = (AssistantMessage) aiResponse.getResult().getOutput();
-                            return assistantMsg.getText();
+                            return callModelAndExtractText(prompt);
                         } else {
                             return "抱歉，找不到名为 '" + toolName + "' 的工具。";
                         }
@@ -379,6 +397,27 @@ public class ConversationAgentService {
             log.error("处理工具调用失败", e);
         }
         return response;
+    }
+
+    /**
+     * 调用 AI 模型并提取回复文本：
+     * 模型返回空结果（无 Generation）或回复为空白时抛出明确异常，
+     * 避免 NPE 裸抛成 500，也避免空白/null 回复被写入会话历史
+     */
+    private String callModelAndExtractText(Prompt prompt) {
+        org.springframework.ai.chat.model.ChatResponse response = chatModel.call(prompt);
+        if (response == null || response.getResult() == null) {
+            throw new IllegalStateException("AI 模型返回了空结果");
+        }
+        AssistantMessage assistantMsg = response.getResult().getOutput();
+        if (assistantMsg == null) {
+            throw new IllegalStateException("AI 模型返回了空消息");
+        }
+        String text = assistantMsg.getText();
+        if (text == null || text.isBlank()) {
+            throw new IllegalStateException("AI 模型返回了空白回复");
+        }
+        return text;
     }
 
     /**

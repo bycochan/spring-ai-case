@@ -72,7 +72,7 @@
                 <ThunderboltOutlined /> MCP
               </a-tag>
               <a-tag v-if="agent.enableImageUpload" color="orange">
-                <PictureOutlined /> 图片
+                <PaperClipOutlined /> 附件
               </a-tag>
               <a-tag v-if="agent.knowledgeBaseId" color="purple">
                 <BookOutlined /> 知识库
@@ -166,9 +166,9 @@
           <span class="help-text">启用后可调用已注册的 MCP 工具</span>
         </a-form-item>
 
-        <a-form-item label="图片上传">
+        <a-form-item label="附件上传">
           <a-switch v-model:checked="agentForm.enableImageUpload" />
-          <span class="help-text">开启后对话中可上传图片（单张 ≤10MB，最多 5 张）</span>
+          <span class="help-text">开启后对话中可上传附件（图片与 PDF/Word/TXT 文档，单个 ≤10MB，最多 5 个）</span>
         </a-form-item>
 
         <a-form-item label="知识库">
@@ -230,7 +230,7 @@ import {
   DeleteOutlined,
   MessageOutlined,
   ThunderboltOutlined,
-  PictureOutlined,
+  PaperClipOutlined,
   BookOutlined
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'

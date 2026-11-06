@@ -114,3 +114,4 @@ application-local.properties
 *.tmp
 *.temp
 .~*
+.env
