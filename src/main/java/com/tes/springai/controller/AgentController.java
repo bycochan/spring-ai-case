@@ -115,7 +115,7 @@ public class AgentController {
             messages.add(new UserMessage(userPrompt));
             
             Prompt prompt = new Prompt(messages);
-            String response = chatModel.call(prompt).getResult().getOutput().getContent();
+            String response = chatModel.call(prompt).getResult().getOutput().getText();
             
             log.info("大模型生成结果: {}", response);
             

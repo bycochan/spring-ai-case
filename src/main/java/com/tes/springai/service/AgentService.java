@@ -36,6 +36,7 @@ public class AgentService {
                         "并根据上下文提供连贯的回答。请保持友好、专业的态度。")
                 .welcomeMessage("你好！我是你的智能助手，有什么可以帮助你的吗？")
                 .enableMCP(false)
+                .enableImageUpload(true)
                 .isDefault(true)
                 .createdAt(System.currentTimeMillis())
                 .build();

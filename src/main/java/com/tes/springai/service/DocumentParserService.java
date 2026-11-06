@@ -8,14 +8,17 @@ import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * 文档解析服务
- * 支持 PDF 和 Word 文档解析
+ * 支持 PDF、Word 和 TXT 文档解析
  */
 @Slf4j
 @Service
@@ -35,19 +38,39 @@ public class DocumentParserService {
 
         log.info("开始解析文档: {}", fileName);
 
-        String content;
-        if (fileName.toLowerCase().endsWith(".pdf")) {
-            content = parsePDF(file.getInputStream());
-        } else if (fileName.toLowerCase().endsWith(".docx")) {
-            content = parseWord(file.getInputStream());
-        } else if (fileName.toLowerCase().endsWith(".doc")) {
-            content = parseWord(file.getInputStream());
-        } else {
-            throw new IllegalArgumentException("不支持的文件格式，仅支持 PDF 和 Word 文档");
-        }
+        String content = parseText(file.getBytes(), fileName);
 
         log.info("文档解析完成: {}, 内容长度: {}", fileName, content.length());
         return content;
+    }
+
+    /**
+     * 按文件名后缀把字节内容解析为纯文本（附件转文本的底层入口）。
+     * PDF 走 PDFBox，Word 走 POI，TXT 按 UTF-8 直读。
+     *
+     * @param data     文件字节数据
+     * @param fileName 原始文件名（用于按后缀判定格式）
+     * @return 解析后的文本内容
+     */
+    public String parseText(byte[] data, String fileName) throws IOException {
+        if (data == null || data.length == 0) {
+            throw new IllegalArgumentException("附件内容为空");
+        }
+        if (fileName == null) {
+            throw new IllegalArgumentException("文件名不能为空");
+        }
+
+        String name = fileName.toLowerCase(Locale.ROOT);
+        if (name.endsWith(".pdf")) {
+            return parsePDF(new ByteArrayInputStream(data));
+        }
+        if (name.endsWith(".docx") || name.endsWith(".doc")) {
+            return parseWord(new ByteArrayInputStream(data));
+        }
+        if (name.endsWith(".txt")) {
+            return new String(data, StandardCharsets.UTF_8);
+        }
+        throw new IllegalArgumentException("不支持的文件格式，仅支持 PDF、Word 和 TXT 文档");
     }
 
     /**

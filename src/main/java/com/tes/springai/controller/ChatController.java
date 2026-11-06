@@ -30,18 +30,20 @@ public class ChatController {
      */
     @PostMapping("/message")
     public ResponseEntity<ChatResponse> sendMessage(@RequestBody ChatRequest request) {
-        log.info("收到聊天请求 - sessionId: {}, message: {}, knowledgeBaseId: {}, enableMCP: {}, agentId: {}", 
-                request.getSessionId(), request.getMessage(), request.getKnowledgeBaseId(), 
-                request.isEnableMCP(), request.getAgentId());
-        
+        log.info("收到聊天请求 - sessionId: {}, message: {}, knowledgeBaseId: {}, enableMCP: {}, agentId: {}, 附件: {} 张",
+                request.getSessionId(), request.getMessage(), request.getKnowledgeBaseId(),
+                request.isEnableMCP(), request.getAgentId(),
+                request.getFileIds() == null ? 0 : request.getFileIds().size());
+
         ChatResponse response = conversationAgentService.chat(
-                request.getSessionId(), 
+                request.getSessionId(),
                 request.getMessage(),
+                request.getFileIds(),
                 request.getKnowledgeBaseId(),
                 request.isEnableMCP(),
                 request.getAgentId()
         );
-        
+
         return ResponseEntity.ok(response);
     }
 

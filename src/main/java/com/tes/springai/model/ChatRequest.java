@@ -2,6 +2,8 @@ package com.tes.springai.model;
 
 import lombok.Data;
 
+import java.util.List;
+
 /**
  * 聊天请求模型
  */
@@ -32,4 +34,9 @@ public class ChatRequest {
      * Agent ID（可选，默认使用默认 Agent）
      */
     private String agentId;
+
+    /**
+     * 附件 fileId 列表（可选，图片与文档共用额度，单条消息最多 5 个）
+     */
+    private List<String> fileIds;
 }

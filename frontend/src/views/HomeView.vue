@@ -71,6 +71,9 @@
               <a-tag v-if="agent.enableMCP" color="green">
                 <ThunderboltOutlined /> MCP
               </a-tag>
+              <a-tag v-if="agent.enableImageUpload" color="orange">
+                <PictureOutlined /> 图片
+              </a-tag>
               <a-tag v-if="agent.knowledgeBaseId" color="purple">
                 <BookOutlined /> 知识库
               </a-tag>
@@ -163,6 +166,11 @@
           <span class="help-text">启用后可调用已注册的 MCP 工具</span>
         </a-form-item>
 
+        <a-form-item label="图片上传">
+          <a-switch v-model:checked="agentForm.enableImageUpload" />
+          <span class="help-text">开启后对话中可上传图片（单张 ≤10MB，最多 5 张）</span>
+        </a-form-item>
+
         <a-form-item label="知识库">
           <a-select
             v-model:value="agentForm.knowledgeBaseId"
@@ -222,6 +230,7 @@ import {
   DeleteOutlined,
   MessageOutlined,
   ThunderboltOutlined,
+  PictureOutlined,
   BookOutlined
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
@@ -242,6 +251,7 @@ const agentForm = ref({
   systemPrompt: '',
   welcomeMessage: '',
   enableMCP: false,
+  enableImageUpload: false,
   knowledgeBaseId: null,
   isDefault: false,
   workflowId: null
@@ -387,6 +397,7 @@ const editAgent = (agent) => {
     systemPrompt: agent.systemPrompt,
     welcomeMessage: agent.welcomeMessage,
     enableMCP: agent.enableMCP,
+    enableImageUpload: agent.enableImageUpload,
     knowledgeBaseId: agent.knowledgeBaseId || null,
     isDefault: agent.isDefault,
     workflowId: agent.workflowId || null
@@ -466,6 +477,7 @@ const resetForm = () => {
     systemPrompt: '',
     welcomeMessage: '',
     enableMCP: false,
+    enableImageUpload: false,
     knowledgeBaseId: null,
     isDefault: false,
     workflowId: null

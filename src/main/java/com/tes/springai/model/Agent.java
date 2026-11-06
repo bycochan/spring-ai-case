@@ -49,6 +49,12 @@ public class Agent {
      */
     @Builder.Default
     private boolean enableMCP = false;
+
+    /**
+     * 是否启用图片上传（多模态对话）
+     */
+    @Builder.Default
+    private boolean enableImageUpload = false;
     
     /**
      * 关联的知识库 ID

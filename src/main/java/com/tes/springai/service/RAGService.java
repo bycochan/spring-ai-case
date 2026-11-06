@@ -116,8 +116,8 @@ public class RAGService {
         
         Prompt prompt = new Prompt(messages);
         org.springframework.ai.chat.model.ChatResponse response = chatModel.call(prompt);
-        String answer = ((org.springframework.ai.chat.messages.AssistantMessage) response.getResult().getOutput()).getContent();
-        
+        String answer = ((org.springframework.ai.chat.messages.AssistantMessage) response.getResult().getOutput()).getText();
+
         log.info("RAG 查询完成");
         return answer;
     }
@@ -178,8 +178,8 @@ public class RAGService {
         
         Prompt prompt = new Prompt(messages);
         org.springframework.ai.chat.model.ChatResponse response = chatModel.call(prompt);
-        String answer = ((org.springframework.ai.chat.messages.AssistantMessage) response.getResult().getOutput()).getContent();
-        
+        String answer = ((org.springframework.ai.chat.messages.AssistantMessage) response.getResult().getOutput()).getText();
+
         log.info("RAG 知识库查询完成");
         return answer;
     }

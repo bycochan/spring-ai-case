@@ -56,7 +56,20 @@
               {{ msg.role === 'user' ? '👤' : '🤖' }}
             </a-avatar>
             <div class="message-bubble">
-              <div class="message-text">{{ msg.content }}</div>
+              <div class="message-images" v-if="msg.images && msg.images.length">
+                <a-image-preview-group>
+                  <a-image
+                    v-for="(fileId, imgIndex) in msg.images"
+                    :key="imgIndex"
+                    :src="attachmentApi.attachmentUrl(fileId)"
+                    :fallback="IMAGE_FALLBACK"
+                    :width="120"
+                    :height="90"
+                    class="message-image"
+                  />
+                </a-image-preview-group>
+              </div>
+              <div class="message-text" v-if="msg.content">{{ msg.content }}</div>
               <div class="message-time">
                 <ClockCircleOutlined />
                 {{ formatTime(msg.timestamp) }}
@@ -78,25 +91,67 @@
         </div>
 
         <div class="input-area">
-          <a-textarea
-            v-model:value="inputMessage"
-            @pressEnter="handleEnter"
-            placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
-            :rows="3"
-            :disabled="isLoading"
-            class="message-input"
-          />
-          <a-button
-            type="primary"
-            size="large"
-            @click="sendMessage"
-            :disabled="!inputMessage.trim() || isLoading"
-            :loading="isLoading"
-            class="send-button"
-          >
-            <template #icon><SendOutlined /></template>
-            {{ isLoading ? '发送中...' : '发送' }}
-          </a-button>
+          <!-- 已上传图片暂存区（一行展示，点击可预览） -->
+          <div class="pending-images" v-if="imageUploadEnabled && pendingImages.length > 0">
+            <div v-for="img in pendingImages" :key="img.key" class="pending-image-item">
+              <div class="pending-image-thumb">
+                <a-spin v-if="img.uploading" size="small" />
+                <a-image
+                  v-else
+                  :src="img.url"
+                  :fallback="IMAGE_FALLBACK"
+                  :width="72"
+                  :height="72"
+                  class="pending-image-img"
+                />
+              </div>
+              <a-button
+                v-if="!img.uploading"
+                size="small"
+                shape="circle"
+                danger
+                class="pending-image-remove"
+                @click="removeImage(img)"
+              >
+                <template #icon><CloseOutlined /></template>
+              </a-button>
+            </div>
+          </div>
+          <div class="input-row">
+            <a-upload
+              v-if="imageUploadEnabled"
+              accept="image/jpeg,image/png,image/gif,image/webp"
+              :show-upload-list="false"
+              :before-upload="handleUploadSelect"
+              :disabled="isLoading || pendingImages.length >= MAX_IMAGE_COUNT"
+            >
+              <a-tooltip title="上传图片（单张 ≤10MB，最多 5 张，支持直接粘贴）">
+                <a-button size="large" class="upload-button">
+                  <template #icon><PictureOutlined /></template>
+                </a-button>
+              </a-tooltip>
+            </a-upload>
+            <a-textarea
+              v-model:value="inputMessage"
+              @pressEnter="handleEnter"
+              @paste="handlePaste"
+              :placeholder="inputPlaceholder"
+              :rows="3"
+              :disabled="isLoading"
+              class="message-input"
+            />
+            <a-button
+              type="primary"
+              size="large"
+              @click="sendMessage"
+              :disabled="sendDisabled"
+              :loading="isLoading"
+              class="send-button"
+            >
+              <template #icon><SendOutlined /></template>
+              {{ isLoading ? '发送中...' : '发送' }}
+            </a-button>
+          </div>
         </div>
       </a-card>
 
@@ -122,7 +177,15 @@
                     <span class="context-role">{{ msg.role === 'user' ? '用户' : 'AI助手' }}</span>
                     <span class="context-time">{{ formatTime(msg.timestamp) }}</span>
                   </div>
-                  <div class="context-message-content">{{ msg.content }}</div>
+                  <div class="context-images" v-if="msg.images && msg.images.length">
+                    <img
+                      v-for="(fileId, imgIndex) in msg.images"
+                      :key="imgIndex"
+                      :src="attachmentApi.attachmentUrl(fileId)"
+                      class="context-image"
+                    />
+                  </div>
+                  <div class="context-message-content" v-if="msg.content">{{ msg.content }}</div>
                 </div>
               </a-timeline-item>
             </a-timeline>
@@ -196,17 +259,20 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
-import { 
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import {
   UserOutlined,
-  DeleteOutlined, 
-  SendOutlined, 
+  DeleteOutlined,
+  SendOutlined,
   ClockCircleOutlined,
   LoadingOutlined,
-  HistoryOutlined
+  HistoryOutlined,
+  PictureOutlined,
+  CloseOutlined
 } from '@ant-design/icons-vue'
-import { chatApi, agentApi, ragApi } from '../api'
+import { chatApi, agentApi, ragApi, attachmentApi } from '../api'
 import { message } from 'ant-design-vue'
+import { useImageUpload, MAX_IMAGE_COUNT, IMAGE_FALLBACK } from '../composables/useImageUpload'
 
 const route = useRoute()
 const messages = ref([])
@@ -223,6 +289,49 @@ const showContextDrawer = ref(false)
 const knowledgeBases = ref([])
 const selectedKnowledgeBaseId = ref(null)
 const currentKnowledgeBaseId = ref(null)
+
+// 图片上传能力：跟随当前 Agent 的功能配置（未指定时为 default Agent）
+const imageUploadEnabled = computed(() => {
+  const agentId = currentAgentId.value || 'default'
+  const agent = agents.value.find(a => a.id === agentId)
+  return !!agent?.enableImageUpload
+})
+
+const {
+  pendingImages,
+  uploadingCount,
+  hasReadyImages,
+  removeImage,
+  handlePaste,
+  handleUploadSelect,
+  getFileIds,
+  restoreImages,
+  clear: clearPendingImages
+} = useImageUpload(imageUploadEnabled)
+
+// 输入框占位文案
+const inputPlaceholder = computed(() =>
+  imageUploadEnabled.value
+    ? '输入消息... (Enter 发送, Shift+Enter 换行，可直接粘贴图片)'
+    : '输入消息... (Enter 发送, Shift+Enter 换行)'
+)
+
+// 发送按钮禁用条件：加载中/图片上传中；无文字且无可发送图片
+const sendDisabled = computed(() => {
+  if (isLoading.value || uploadingCount.value > 0) return true
+  const hasText = inputMessage.value.trim().length > 0
+  return !(hasText || hasReadyImages.value)
+})
+
+// 切换 Agent 后若新 Agent 未开启图片上传，清空暂存区并释放服务端附件
+watch(imageUploadEnabled, (enabled) => {
+  if (!enabled && pendingImages.value.length > 0) {
+    pendingImages.value.forEach(img => {
+      if (img.fileId) attachmentApi.deleteAttachment(img.fileId).catch(() => {})
+    })
+    clearPendingImages()
+  }
+})
 
 // 加载所有 Agent
 const loadAgents = async () => {
@@ -319,30 +428,39 @@ const handleEnter = (e) => {
 
 // 发送消息
 const sendMessage = async () => {
-  if (!inputMessage.value.trim() || isLoading.value) return
+  if (sendDisabled.value) return
+  if (uploadingCount.value > 0) {
+    message.warning('图片上传中，请稍候')
+    return
+  }
 
   const userMessage = inputMessage.value.trim()
-  
-  // 添加用户消息
+  const fileIds = getFileIds()
+  const userMsgIndex = messages.value.length
+
+  // 添加用户消息（含图片附件）
   messages.value.push({
     role: 'user',
     content: userMessage,
+    images: fileIds,
     timestamp: Date.now()
   })
 
-  // 清空输入框
+  // 清空输入框与图片暂存区
   inputMessage.value = ''
+  clearPendingImages()
 
   scrollToBottom()
   isLoading.value = true
 
   try {
     const response = await chatApi.sendMessage(
-      sessionId.value, 
-      userMessage, 
-      currentKnowledgeBaseId.value, 
-      enableMCP.value, 
-      currentAgentId.value
+      sessionId.value,
+      userMessage,
+      currentKnowledgeBaseId.value,
+      enableMCP.value,
+      currentAgentId.value,
+      fileIds
     )
     const data = response.data
 
@@ -350,7 +468,7 @@ const sendMessage = async () => {
     if (data.sessionId) {
       sessionId.value = data.sessionId
     }
-    
+
     // 更新 Agent ID
     if (data.agentId) {
       currentAgentId.value = data.agentId
@@ -366,6 +484,10 @@ const sendMessage = async () => {
     scrollToBottom()
   } catch (error) {
     console.error('发送消息失败:', error)
+    // 撤回未送达的用户消息，恢复输入与附件便于重试
+    messages.value.splice(userMsgIndex, 1)
+    inputMessage.value = userMessage
+    restoreImages(fileIds)
     messages.value.push({
       role: 'assistant',
       content: '抱歉，发送消息时出现错误: ' + (error.response?.data?.error || error.message),
@@ -654,12 +776,98 @@ onMounted(async () => {
 
 .input-area {
   flex-shrink: 0;
-  padding: 28px 40px;
+  padding: 20px 40px 24px;
   background: white;
   border-top: 1px solid #e8e8e8;
   display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.input-row {
+  display: flex;
   gap: 18px;
   align-items: flex-end;
+}
+
+.upload-button {
+  height: 56px;
+  width: 56px;
+  border-radius: 10px;
+  font-size: 20px;
+}
+
+/* 已上传图片暂存区 */
+.pending-images {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.pending-image-item {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.pending-image-thumb {
+  width: 72px;
+  height: 72px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #e8e8e8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fafafa;
+}
+
+.pending-image-thumb :deep(.ant-image),
+.pending-image-thumb :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pending-image-remove {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  z-index: 2;
+}
+
+/* 消息气泡中的图片 */
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.message-item.user .message-images {
+  justify-content: flex-end;
+}
+
+.message-images :deep(.ant-image img) {
+  object-fit: cover;
+  border-radius: 8px;
+}
+
+/* 上下文面板图片缩略图 */
+.context-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.context-image {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #e8e8e8;
 }
 
 .message-input {

@@ -6,7 +6,7 @@ import com.tes.springai.service.workflow.NodeExecutor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
+import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -40,7 +40,7 @@ public class LLMNodeExecutor implements NodeExecutor {
         Map<String, Object> config = node.getConfig();
         String systemPrompt = (String) config.get("systemPrompt");
         String userPromptTemplate = (String) config.get("userPrompt");
-        String model = (String) config.getOrDefault("model", "qwen-turbo");
+        String model = (String) config.getOrDefault("model", "glm-5.3-flash");
         Double temperature = config.get("temperature") != null ? 
             ((Number) config.get("temperature")).doubleValue() : 0.7;
         
@@ -66,7 +66,9 @@ public class LLMNodeExecutor implements NodeExecutor {
                 log.info("使用知识库: {}", knowledgeBaseId);
                 // 添加RAG advisor
                 builder = builder.defaultAdvisors(
-                    new QuestionAnswerAdvisor(vectorStore, SearchRequest.defaults())
+                    QuestionAnswerAdvisor.builder(vectorStore)
+                        .searchRequest(SearchRequest.builder().build())
+                        .build()
                 );
             }
             

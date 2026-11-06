@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 // 根据环境自动切换 API 地址
-const API_BASE_URL = import.meta.env.PROD ? '' : 'http://localhost:8080'
+const API_BASE_URL = import.meta.env.PROD ? '' : 'http://localhost:8089'
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -13,13 +13,14 @@ const api = axios.create({
 // 聊天 API
 export const chatApi = {
   // 发送消息
-  sendMessage(sessionId, message, knowledgeBaseId = null, enableMCP = false, agentId = null) {
+  sendMessage(sessionId, message, knowledgeBaseId = null, enableMCP = false, agentId = null, fileIds = []) {
     return api.post('/api/chat/message', {
       sessionId,
       message,
       knowledgeBaseId,
       enableMCP,
-      agentId
+      agentId,
+      fileIds
     })
   },
 
@@ -31,6 +32,31 @@ export const chatApi = {
   // 清除会话
   clearSession(sessionId) {
     return api.delete(`/api/chat/session/${sessionId}`)
+  }
+}
+
+// 附件 API
+export const attachmentApi = {
+  // 上传图片附件
+  uploadImage(file) {
+    const formData = new FormData()
+    formData.append('file', file)
+
+    return api.post('/api/attachment/upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data'
+      }
+    })
+  },
+
+  // 删除附件（发送前移除时调用，释放服务端内存）
+  deleteAttachment(fileId) {
+    return api.delete(`/api/attachment/${fileId}`)
+  },
+
+  // 附件访问地址（供 <img> 直接展示与历史回显）
+  attachmentUrl(fileId) {
+    return `${API_BASE_URL}/api/attachment/${fileId}`
   }
 }
 
