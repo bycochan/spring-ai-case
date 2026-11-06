@@ -71,6 +71,25 @@ class AttachmentServiceTest {
         assertTrue(ex.getMessage().contains("10MB"));
     }
 
+    @Test
+    void testUploadRejectsDocumentExtensionWithForeignContentType() {
+        // 扩展名兜底仅对通用二进制类型生效：application/zip 冒用 .pdf 后缀应被拒绝
+        MultipartFile file = file("evil.pdf", "application/zip", new byte[]{1, 2, 3});
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> attachmentService.upload(file));
+        assertTrue(ex.getMessage().contains("不支持"));
+    }
+
+    @Test
+    void testUploadAcceptsDocumentAsOctetStream() {
+        // 部分客户端对文档统一上传为 application/octet-stream，按扩展名兜底放行
+        var attachment = attachmentService.upload(file("report.pdf", "application/octet-stream",
+                AttachmentFixtures.minimalPdf()));
+
+        assertEquals("report.pdf", attachment.getFileName());
+    }
+
     // ---------- 附件转文本（唯一新缝：extractText） ----------
 
     @Test
@@ -115,6 +134,16 @@ class AttachmentServiceTest {
     @Test
     void testExtractTextRejectsCorruptedPdf() {
         String fileId = attachmentService.upload(AttachmentFixtures.corruptedPdfFile("broken.pdf")).getFileId();
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> attachmentService.extractText(fileId));
+        assertTrue(ex.getMessage().contains("解析失败"));
+    }
+
+    @Test
+    void testExtractTextRejectsPdfWithoutTextLayer() {
+        // 无文本层的扫描件 PDF：解析成功但提取不到任何文本，应按解析失败处理
+        String fileId = attachmentService.upload(AttachmentFixtures.emptyPdfFile("scan.pdf")).getFileId();
 
         IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
                 () -> attachmentService.extractText(fileId));

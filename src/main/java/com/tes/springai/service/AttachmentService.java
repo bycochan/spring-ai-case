@@ -106,16 +106,26 @@ public class AttachmentService {
 
     /**
      * 判断附件类型是否允许上传：
-     * 图片仅按 MIME 白名单校验；文档按 MIME 白名单校验，另按扩展名兜底
-     * （部分客户端对文档统一上传为 application/octet-stream）
+     * 图片与文档均按 MIME 白名单校验；文档另按扩展名兜底，
+     * 但兜底仅对未携带类型或通用二进制类型（application/octet-stream）生效，
+     * 防止其他格式文件冒用文档扩展名绕过 MIME 校验
      */
     private boolean isAllowedType(String contentType, String fileName) {
         if (contentType != null && ALLOWED_CONTENT_TYPES.contains(contentType)) {
             return true;
         }
-        return contentType != null
-                && DOCUMENT_CONTENT_TYPES.contains(contentType.toLowerCase(Locale.ROOT))
-                || isDocumentExtension(fileName);
+        if (contentType != null && DOCUMENT_CONTENT_TYPES.contains(contentType.toLowerCase(Locale.ROOT))) {
+            return true;
+        }
+        return isGenericBinaryType(contentType) && isDocumentExtension(fileName);
+    }
+
+    /**
+     * 判断是否为未携带类型或通用二进制类型（扩展名兜底仅适用这两类）
+     */
+    private boolean isGenericBinaryType(String contentType) {
+        return contentType == null
+                || "application/octet-stream".equals(contentType.toLowerCase(Locale.ROOT));
     }
 
     /**
@@ -196,7 +206,12 @@ public class AttachmentService {
             throw new IllegalArgumentException("图片附件不支持文本提取: " + fileId);
         }
         try {
-            return documentParserService.parseText(attachment.getData(), attachment.getFileName());
+            String text = documentParserService.parseText(attachment.getData(), attachment.getFileName());
+            if (text == null || text.isBlank()) {
+                // 无文本层的扫描件 PDF、纯空白文件等：解析成功但读不到内容，按解析失败处理而非静默返回空文本
+                throw new IllegalStateException("未从文档中提取到任何文本");
+            }
+            return text;
         } catch (Exception e) {
             log.warn("附件文本提取失败: {} ({})", attachment.getFileName(), fileId, e);
             throw new IllegalArgumentException("附件解析失败，文件可能已损坏或无法提取文本: " + attachment.getFileName(), e);

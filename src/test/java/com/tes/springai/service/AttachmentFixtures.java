@@ -44,6 +44,20 @@ final class AttachmentFixtures {
         return new MockMultipartFile("file", name, "application/pdf", "这不是有效的PDF内容".getBytes(StandardCharsets.UTF_8));
     }
 
+    /**
+     * 有效但无文本层的 PDF（空页面）：上传可通过，提取必然得到空文本
+     */
+    static MultipartFile emptyPdfFile(String name) {
+        try (PDDocument document = new PDDocument();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            document.addPage(new PDPage());
+            document.save(out);
+            return new MockMultipartFile("file", name, "application/pdf", out.toByteArray());
+        } catch (Exception e) {
+            throw new IllegalStateException("生成空文本层 PDF 夹具失败", e);
+        }
+    }
+
     static MultipartFile pngFile(String name) {
         return new MockMultipartFile("file", name, "image/png", new byte[]{(byte) 0x89, 'P', 'N', 'G'});
     }
@@ -51,7 +65,7 @@ final class AttachmentFixtures {
     /**
      * 用 PDFBox 生成包含固定文本的最小有效 PDF
      */
-    private static byte[] minimalPdf() {
+    static byte[] minimalPdf() {
         try (PDDocument document = new PDDocument();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             PDPage page = new PDPage();

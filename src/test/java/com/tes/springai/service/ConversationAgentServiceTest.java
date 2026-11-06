@@ -269,6 +269,23 @@ class ConversationAgentServiceTest {
         assertTrue(ex.getMessage().contains("附件上传"));
     }
 
+    @Test
+    void testPdfWithoutTextLayerDegradesGracefully() {
+        // 无文本层的扫描件 PDF：不报错中断，降级为带文件名的"提取失败"占位提示
+        String fileId = attachmentService.upload(AttachmentFixtures.emptyPdfFile("scan.pdf")).getFileId();
+        stubAssistantReply("没有读到内容");
+
+        ChatResponse response = conversationAgentService
+                .chat("doc-session-4", "读这个扫描件", List.of(fileId), null, false, "doc-agent");
+
+        assertEquals("没有读到内容", response.getMessage());
+        ArgumentCaptor<Prompt> captor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel, atLeastOnce()).call(captor.capture());
+        String userText = lastUserText(captor.getValue());
+        assertTrue(userText.contains("scan.pdf"), "占位提示应带文件名，实际为: " + userText);
+        assertTrue(userText.contains("提取失败"), "无文本层 PDF 应以占位提示降级，实际为: " + userText);
+    }
+
     /**
      * 桩定 AI 回复文本
      */

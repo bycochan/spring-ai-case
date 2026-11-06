@@ -30,7 +30,7 @@ public class ChatController {
      */
     @PostMapping("/message")
     public ResponseEntity<ChatResponse> sendMessage(@RequestBody ChatRequest request) {
-        log.info("收到聊天请求 - sessionId: {}, message: {}, knowledgeBaseId: {}, enableMCP: {}, agentId: {}, 附件: {} 张",
+        log.info("收到聊天请求 - sessionId: {}, message: {}, knowledgeBaseId: {}, enableMCP: {}, agentId: {}, 附件: {} 个",
                 request.getSessionId(), request.getMessage(), request.getKnowledgeBaseId(),
                 request.isEnableMCP(), request.getAgentId(),
                 request.getFileIds() == null ? 0 : request.getFileIds().size());
