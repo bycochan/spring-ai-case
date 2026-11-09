@@ -16,8 +16,15 @@
     "@vue-flow/minimap": "^1.5.0",
     "ant-design-vue": "^4.2.6",
     "axios": "^1.13.2",
+    "dompurify": "^3.4.17",
+    "echarts": "^6.1.0",
+    "katex": "^0.19.1",
+    "mermaid": "^11.17.2",
+    "shiki": "^3.23.0",
+    "shiki-stream": "^0.1.4",
     "vue": "^3.5.24",
-    "vue-router": "^4.6.4"
+    "vue-router": "^4.6.4",
+    "x-markdown-vue": "^0.0.204"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.1",
