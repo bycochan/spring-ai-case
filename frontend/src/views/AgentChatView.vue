@@ -92,7 +92,17 @@
                 <span class="doc-chip-name">{{ att.fileName }}</span>
               </a>
             </div>
-            <div class="message-text" v-if="msg.content">{{ msg.content }}</div>
+            <div class="message-text" v-if="msg.role === 'user'">{{ msg.content }}</div>
+            <template v-else>
+              <ThinkingBlock :thinking="msg.thinking" :streaming="!!msg.streaming" />
+              <ToolSteps v-if="msg.tools && msg.tools.length" :tools="msg.tools" />
+              <div class="message-text">
+                <span v-if="!msg.content && msg.streaming" class="stream-waiting">
+                  <LoadingOutlined spin /> 正在思考...
+                </span>
+                <MarkdownMessage v-else :content="msg.content" :streaming="!!msg.streaming" />
+              </div>
+            </template>
             <div class="message-time">
               <ClockCircleOutlined />
               {{ formatTime(msg.timestamp) }}
@@ -100,18 +110,6 @@
           </div>
         </div>
 
-        <!-- 加载中 -->
-        <div v-if="isLoading" class="message-item assistant">
-          <a-avatar :size="48" class="message-avatar">{{ currentAgent?.avatar || '🤖' }}</a-avatar>
-          <div class="message-bubble">
-            <a-spin>
-              <template #indicator>
-                <LoadingOutlined style="font-size: 24px" spin />
-              </template>
-            </a-spin>
-            <span style="margin-left: 12px">思考中...</span>
-          </div>
-        </div>
       </div>
 
       <!-- 输入区 -->
@@ -171,15 +169,25 @@
             </a-tooltip>
           </a-upload>
           <a-button
+            v-if="isLoading"
+            danger
+            size="large"
+            @click="stopStream"
+            class="send-button"
+          >
+            <template #icon><PauseCircleOutlined /></template>
+            停止生成
+          </a-button>
+          <a-button
+            v-else
             type="primary"
             size="large"
             @click="sendMessage"
             :disabled="sendDisabled"
-            :loading="isLoading"
             class="send-button"
           >
             <template #icon><SendOutlined /></template>
-            {{ isLoading ? '发送中...' : '发送' }}
+            发送
           </a-button>
         </div>
       </div>
@@ -248,11 +256,16 @@ import {
   PaperClipOutlined,
   FileTextOutlined,
   CloseOutlined,
-  BookOutlined
+  BookOutlined,
+  PauseCircleOutlined
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import { chatApi, agentApi, attachmentApi } from '../api'
 import { useAttachmentUpload, MAX_ATTACHMENT_COUNT, UPLOAD_ACCEPT, IMAGE_FALLBACK } from '../composables/useAttachmentUpload'
+import { useChatStream } from '../composables/useChatStream'
+import MarkdownMessage from '../components/MarkdownMessage.vue'
+import ThinkingBlock from '../components/ThinkingBlock.vue'
+import ToolSteps from '../components/ToolSteps.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -264,6 +277,8 @@ const isLoading = ref(false)
 const sessionId = ref(null)
 const messagesContainer = ref(null)
 const showHistoryDrawer = ref(false)
+
+const { start: startStream, stop: stopStream } = useChatStream()
 
 // 附件上传能力：跟随 Agent 的功能配置
 const attachmentEnabled = computed(() => !!currentAgent.value?.enableImageUpload)
@@ -324,7 +339,7 @@ const handleEnter = (e) => {
   }
 }
 
-// 发送消息
+// 发送消息（流式）：先建空助手消息，事件增量追加，打字机模式
 const sendMessage = async () => {
   if (sendDisabled.value) return
   if (uploadingCount.value > 0) {
@@ -359,50 +374,57 @@ const sendMessage = async () => {
 
   isLoading.value = true
 
+  // 先建空助手消息，流式增量直接写入该对象
+  const assistantMsg = {
+    role: 'assistant',
+    content: '',
+    thinking: '',
+    tools: [],
+    streaming: true,
+    timestamp: Date.now()
+  }
+  messages.value.push(assistantMsg)
+  scrollToBottom()
+
   try {
-    const response = await chatApi.sendMessage(
-      sessionId.value,
-      userMessage,
-      currentAgent.value?.knowledgeBaseId || null,
-      currentAgent.value?.enableMCP || false,
-      currentAgent.value?.id || 'default',
-      fileIds
+    const meta = await startStream(
+      {
+        sessionId: sessionId.value,
+        message: userMessage,
+        knowledgeBaseId: currentAgent.value?.knowledgeBaseId || null,
+        enableMCP: currentAgent.value?.enableMCP || false,
+        agentId: currentAgent.value?.id || 'default',
+        fileIds
+      },
+      assistantMsg,
+      { onUpdate: scrollToBottom }
     )
 
-    const data = response.data
-
-    // 更新会话ID
-    if (data.sessionId) {
-      sessionId.value = data.sessionId
+    // done 元数据同步会话
+    if (meta?.sessionId) {
+      sessionId.value = meta.sessionId
     }
 
-    // 添加助手回复
-    const aiMessage = data.message || data.response || data.content || '没有收到回复内容'
-
-    messages.value.push({
-      role: 'assistant',
-      content: aiMessage,
-      timestamp: Date.now()
-    })
-
-    // 等待 DOM 更新后滚动
     await nextTick()
     scrollToBottom()
   } catch (error) {
     console.error('发送消息失败:', error)
-    // 撤回未送达的用户消息，恢复输入与附件便于重试
+    // 服务端已回滚本轮用户消息：撤回用户气泡并恢复输入与附件，便于重试
     messages.value.splice(userMsgIndex, 1)
+    const errorText = '抱歉，' + (error.message || '发送消息时出现错误，请稍后重试')
+    if (assistantMsg.content) {
+      // 已有部分内容：保留并标注可能不完整
+      assistantMsg.content += '\n\n*（回复生成中断，以上内容可能不完整）*'
+    } else {
+      assistantMsg.content = errorText
+    }
     inputMessage.value = userMessage
     restoreAttachments(savedAttachments)
-    messages.value.push({
-      role: 'assistant',
-      content: '抱歉，发送消息时出现错误: ' + (error.response?.data?.error || error.message),
-      timestamp: Date.now()
-    })
     await nextTick()
     scrollToBottom()
   } finally {
     isLoading.value = false
+    assistantMsg.streaming = false
   }
 }
 
@@ -664,6 +686,14 @@ onMounted(async () => {
   border: none;
   border-radius: 20px 20px 4px 20px;
   box-shadow: 0 4px 16px rgba(102, 126, 234, 0.25);
+}
+
+/* 流式等待提示（尚未收到首个增量时） */
+.stream-waiting {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #999;
 }
 
 .message-time {

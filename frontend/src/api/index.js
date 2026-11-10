@@ -24,6 +24,55 @@ export const chatApi = {
     })
   },
 
+  // 流式发送消息（SSE）：fetch + ReadableStream 解析事件流，支持 AbortController 中断。
+  // axios 无法消费流式响应，此处单独使用 fetch；事件 data 为 JSON，type 字段区分
+  // delta/thinking/tool_call/tool_result/done/error。onEvent 逐条回调，resolve 于流结束。
+  // 校验类错误（响应提交前）仍为 HTTP 错误码，读取 JSON 错误体后 reject。
+  async sendMessageStream(params, { onEvent, signal } = {}) {
+    const response = await fetch(`${API_BASE_URL}/api/chat/message/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: params.sessionId ?? null,
+        message: params.message,
+        knowledgeBaseId: params.knowledgeBaseId ?? null,
+        enableMCP: params.enableMCP ?? false,
+        agentId: params.agentId ?? null,
+        fileIds: params.fileIds ?? []
+      }),
+      signal
+    })
+
+    if (!response.ok) {
+      let errorMessage = `请求失败（${response.status}）`
+      try {
+        const data = await response.json()
+        errorMessage = data.error || data.message || errorMessage
+      } catch {
+        // 错误体非 JSON 时使用默认提示
+      }
+      throw new Error(errorMessage)
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      // SSE 事件以空行分隔；最后一段可能是未接收完整的事件，留待下次拼接
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() ?? ''
+      for (const part of parts) {
+        const event = parseSseEvent(part)
+        if (event && onEvent) onEvent(event)
+      }
+    }
+  },
+
   // 获取会话历史
   getHistory(sessionId) {
     return api.get(`/api/chat/history/${sessionId}`)
@@ -32,6 +81,23 @@ export const chatApi = {
   // 清除会话
   clearSession(sessionId) {
     return api.delete(`/api/chat/session/${sessionId}`)
+  }
+}
+
+// 解析单条 SSE 事件文本（data: 行）为 JSON 载荷
+function parseSseEvent(part) {
+  const dataLines = part
+    .split('\n')
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trim())
+  if (!dataLines.length) return null
+  const payload = dataLines.join('\n')
+  if (!payload) return null
+  try {
+    return JSON.parse(payload)
+  } catch {
+    // 非 JSON 载荷，跳过
+    return null
   }
 }
 

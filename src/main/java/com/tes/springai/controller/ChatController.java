@@ -1,13 +1,19 @@
 package com.tes.springai.controller;
 
+import com.google.gson.Gson;
 import com.tes.springai.model.ChatMessage;
 import com.tes.springai.model.ChatRequest;
 import com.tes.springai.model.ChatResponse;
+import com.tes.springai.model.ChatStreamEvent;
 import com.tes.springai.service.ConversationAgentService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
 
 import java.util.List;
 
@@ -21,6 +27,8 @@ import java.util.List;
 public class ChatController {
 
     private final ConversationAgentService conversationAgentService;
+
+    private final Gson gson = new Gson();
 
     /**
      * 发送聊天消息
@@ -45,6 +53,39 @@ public class ChatController {
         );
 
         return ResponseEntity.ok(response);
+    }
+
+    /**
+     * 流式发送聊天消息（SSE）：
+     * 模型每产出一个增量文本实时推送一条事件，事件 data 为 JSON，type 字段区分
+     * delta/thinking/tool_call/tool_result/done/error（见 ChatStreamEvent）。
+     * 校验类错误在 SSE 响应提交前同步抛出，仍走全局异常处理器返回 HTTP 错误码；
+     * 流式过程中的错误在流内以 error 事件表达（响应提交后无法再改状态码）。
+     *
+     * @param request 聊天请求（与同步端点入参一致）
+     * @return SSE 事件流
+     */
+    @PostMapping(value = "/message/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public ResponseEntity<Flux<ServerSentEvent<String>>> streamMessage(@RequestBody ChatRequest request) {
+        log.info("收到流式聊天请求 - sessionId: {}, message: {}, knowledgeBaseId: {}, enableMCP: {}, agentId: {}, 附件: {} 个",
+                request.getSessionId(), request.getMessage(), request.getKnowledgeBaseId(),
+                request.isEnableMCP(), request.getAgentId(),
+                request.getFileIds() == null ? 0 : request.getFileIds().size());
+
+        Flux<ChatStreamEvent> events = conversationAgentService.chatStream(
+                request.getSessionId(),
+                request.getMessage(),
+                request.getFileIds(),
+                request.getKnowledgeBaseId(),
+                request.isEnableMCP(),
+                request.getAgentId()
+        );
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CACHE_CONTROL, "no-cache")
+                // 声明反向代理不缓冲，保证 SSE 逐条下发（Nginx 等默认缓冲会破坏流式体验）
+                .header("X-Accel-Buffering", "no")
+                .body(events.map(event -> ServerSentEvent.builder(gson.toJson(event)).build()));
     }
 
     /**

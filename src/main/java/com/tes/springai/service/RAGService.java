@@ -7,9 +7,11 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import reactor.core.publisher.Flux;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -136,51 +138,98 @@ public class RAGService {
     public String ragQueryWithKnowledgeBase(String question, String knowledgeBaseId, int topK) {
         log.info("RAG 知识库查询: {}, 知识库: {}", question, knowledgeBaseId);
 
+        RagQueryPlan plan = planKnowledgeBaseQuery(question, knowledgeBaseId, topK);
+        if (plan.fallbackText() != null) {
+            return plan.fallbackText();
+        }
+
+        // 调用 AI 模型
+        org.springframework.ai.chat.model.ChatResponse response = chatModel.call(plan.prompt());
+        String answer = ((org.springframework.ai.chat.messages.AssistantMessage) response.getResult().getOutput()).getText();
+
+        log.info("RAG 知识库查询完成");
+        return answer;
+    }
+
+    /**
+     * 基于知识库的 RAG 问答（流式变体）：
+     * 检索与提示词构建逻辑与 ragQueryWithKnowledgeBase 完全一致，仅把阻塞式模型调用替换为流式调用；
+     * 无文档/无命中时以单条增量流降级，保证流式链路仍有完整的 delta→done 事件序列
+     */
+    public Flux<org.springframework.ai.chat.model.ChatResponse> ragQueryWithKnowledgeBaseStream(
+            String question, String knowledgeBaseId, int topK) {
+        log.info("RAG 知识库流式查询: {}, 知识库: {}", question, knowledgeBaseId);
+
+        RagQueryPlan plan = planKnowledgeBaseQuery(question, knowledgeBaseId, topK);
+        if (plan.fallbackText() != null) {
+            log.info("RAG 知识库流式查询降级: {}", plan.fallbackText());
+            return singleResponseFlux(plan.fallbackText());
+        }
+
+        return chatModel.stream(plan.prompt());
+    }
+
+    /**
+     * 知识库查询计划：检索与提示词构建结果（prompt）或降级文案（fallbackText）二选一
+     */
+    private record RagQueryPlan(Prompt prompt, String fallbackText) {
+    }
+
+    /**
+     * 知识库查询的公共检索与提示词构建流程（同步/流式两链路共用）：
+     * 文档列表校验 → 向量化 → 知识库内向量搜索 → 上下文与提示词构建；
+     * 无文档/无命中时返回降级文案
+     */
+    private RagQueryPlan planKnowledgeBaseQuery(String question, String knowledgeBaseId, int topK) {
         // 获取知识库的文档列表
         List<String> documentIds = knowledgeBaseService.getDocumentIds(knowledgeBaseId);
-        
+
         if (documentIds.isEmpty()) {
-            return "抱歉，该知识库中还没有文档。";
+            return new RagQueryPlan(null, "抱歉，该知识库中还没有文档。");
         }
 
         // 将问题转换为向量
         List<Float> queryVector = embeddingService.generateEmbedding(question);
-        
+
         // 向量搜索相关文档（需要过滤知识库内的文档）
         List<DocumentChunk> relevantChunks = vectorStoreService.searchInDocuments(queryVector, documentIds, topK);
-        
+
         if (relevantChunks.isEmpty()) {
-            return "抱歉，在知识库中没有找到相关信息。";
+            return new RagQueryPlan(null, "抱歉，在知识库中没有找到相关信息。");
         }
-        
+
         // 构建上下文
         StringBuilder context = new StringBuilder();
         context.append("以下是从知识库中找到的相关文档片段：\n\n");
-        
+
         for (int i = 0; i < relevantChunks.size(); i++) {
             DocumentChunk chunk = relevantChunks.get(i);
             context.append(String.format("[片段 %d - 来自文件: %s]\n", i + 1, chunk.getFileName()));
             context.append(chunk.getContent()).append("\n\n");
         }
-        
+
         // 构建提示词
         String systemPrompt = "你是一个智能文档助手。请基于提供的文档片段回答用户的问题。" +
                 "如果文档中没有相关信息，请明确告知用户。回答要准确、简洁。";
-        
-        String userPrompt = context.toString() + 
-                "\n问题：" + question + 
+
+        String userPrompt = context.toString() +
+                "\n问题：" + question +
                 "\n\n请基于以上文档片段回答问题：";
-        
-        // 调用 AI 模型
+
         List<Message> messages = new ArrayList<>();
         messages.add(new SystemMessage(systemPrompt));
         messages.add(new UserMessage(userPrompt));
-        
-        Prompt prompt = new Prompt(messages);
-        org.springframework.ai.chat.model.ChatResponse response = chatModel.call(prompt);
-        String answer = ((org.springframework.ai.chat.messages.AssistantMessage) response.getResult().getOutput()).getText();
 
-        log.info("RAG 知识库查询完成");
-        return answer;
+        return new RagQueryPlan(new Prompt(messages), null);
+    }
+
+    /**
+     * 构造只含单条文本增量的模型流（降级文案复用正常流式事件序列）
+     */
+    private Flux<org.springframework.ai.chat.model.ChatResponse> singleResponseFlux(String text) {
+        org.springframework.ai.chat.messages.AssistantMessage message =
+                new org.springframework.ai.chat.messages.AssistantMessage(text);
+        Generation generation = new Generation(message);
+        return Flux.just(new org.springframework.ai.chat.model.ChatResponse(List.of(generation)));
     }
 }

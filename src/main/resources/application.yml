@@ -1,6 +1,10 @@
 spring:
   application:
     name: spring-ai-agent
+  mvc:
+    async:
+      # 流式回复耗时较长：显式放宽 MVC 异步请求超时（毫秒），避免长回复撞容器默认异步超时中断流
+      request-timeout: 300000
   servlet:
     multipart:
       # 附件上传限制：单张图片 10MB（不设置时 Spring Boot 默认单文件仅 1MB）

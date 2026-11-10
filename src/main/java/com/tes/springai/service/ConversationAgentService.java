@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.tes.springai.model.Attachment;
 import com.tes.springai.model.ChatMessage;
 import com.tes.springai.model.ChatResponse;
+import com.tes.springai.model.ChatStreamEvent;
 import com.tes.springai.model.mcp.MCPTool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -16,6 +17,9 @@ import org.springframework.ai.content.Media;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.stereotype.Service;
 import org.springframework.util.MimeTypeUtils;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -63,6 +67,95 @@ public class ConversationAgentService {
     private final Map<String, String> sessionAgents = new ConcurrentHashMap<>();
 
     /**
+     * 对话前置流程结果：Agent 解析、附件校验、会话历史初始化与用户消息登记后的上下文
+     */
+    private record ConversationSetup(String sessionId, String agentId, com.tes.springai.model.Agent agent,
+                                     List<HistoryEntry> history, HistoryEntry userEntry,
+                                     boolean newSession, List<Attachment> attachments) {
+    }
+
+    /**
+     * 流式收尾上下文：负责流结束后的历史写入、异常/中断时的用户消息回滚与流内事件构造。
+     * 历史写入时机：助手消息仅在流正常结束后写入；空白回复与异常、客户端中断均不入历史
+     */
+    private class StreamContext {
+        private final String sessionId;
+        private final String agentId;
+        private final boolean newSession;
+        private final String welcomeMessage;
+        private final List<HistoryEntry> history;
+        private final HistoryEntry userEntry;
+        /** 本轮是否已收尾（回滚过），避免异常/中断/完成路径重复处理 */
+        private volatile boolean settled;
+
+        private StreamContext(String sessionId, String agentId, boolean newSession, String welcomeMessage,
+                              List<HistoryEntry> history, HistoryEntry userEntry) {
+            this.sessionId = sessionId;
+            this.agentId = agentId;
+            this.newSession = newSession;
+            this.welcomeMessage = welcomeMessage;
+            this.history = history;
+            this.userEntry = userEntry;
+        }
+
+        /**
+         * 流正常结束：全文非空白则写入助手历史并回 done 元数据；
+         * 空白回复沿用既有"不入历史"语义，回滚后回 error 事件
+         */
+        ChatStreamEvent complete(StringBuilder content) {
+            if (settled) {
+                // 已因错误回滚，不再写历史、不再回 done
+                return null;
+            }
+            settled = true;
+            String fullText = content.toString();
+            if (fullText.isBlank()) {
+                history.remove(userEntry);
+                return errorEvent("AI 模型返回了空白回复");
+            }
+            history.add(new HistoryEntry("assistant", fullText, List.of()));
+            log.info("会话 {} AI 回复(流式): {}", sessionId, fullText);
+            int conversationRound = (history.size() - 1) / 2;
+            return ChatStreamEvent.builder()
+                    .type(ChatStreamEvent.TYPE_DONE)
+                    .sessionId(sessionId)
+                    .conversationRound(conversationRound)
+                    .welcomeMessage(newSession ? welcomeMessage : null)
+                    .agentId(agentId)
+                    .build();
+        }
+
+        /**
+         * 流内异常：回滚本轮用户消息（与同步链路一致，不残留无回复的脏数据），回 error 事件
+         */
+        ChatStreamEvent fail(Throwable e) {
+            String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            log.error("流式对话异常: {}", detail, e);
+            rollback();
+            return errorEvent("AI 服务调用失败，请稍后重试: " + detail);
+        }
+
+        /**
+         * 当前会话历史（工具结果回喂后的二次模型调用需要基于最新历史构建 Prompt）
+         */
+        List<HistoryEntry> history() {
+            return history;
+        }
+
+        /**
+         * 客户端中断等取消路径：已生成的部分文本不入历史（与刷新丢失语义一致），回滚用户消息
+         */
+        void rollback() {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            history.remove(userEntry);
+            log.info("会话 {} 流式中断，已回滚本轮用户消息", sessionId);
+        }
+    }
+
+    /**
      * 系统提示词，定义 Agent 的角色和行为
      */
     private static final String SYSTEM_PROMPT =
@@ -97,6 +190,299 @@ public class ConversationAgentService {
      */
     public ChatResponse chat(String sessionId, String userMessage, List<String> fileIds,
                             String knowledgeBaseId, boolean enableMCP, String agentId) {
+        ConversationSetup setup = prepareConversation(sessionId, userMessage, fileIds, agentId, enableMCP);
+        List<HistoryEntry> history = setup.history();
+
+        // 如果指定了知识库，使用 RAG
+        String assistantResponse;
+        try {
+            if (knowledgeBaseId != null && !knowledgeBaseId.isEmpty()) {
+                log.info("使用知识库: {}", knowledgeBaseId);
+                assistantResponse = ragService.ragQueryWithKnowledgeBase(userMessage, knowledgeBaseId, 3);
+            } else {
+                log.info("会话 {} 收到用户消息: {} (附件 {} 个)", setup.sessionId(), userMessage, setup.attachments().size());
+
+                // 由历史条目构建 Prompt（按需重建多模态 Media）并调用 AI 模型
+                Prompt prompt = new Prompt(buildMessages(history));
+                assistantResponse = callModelAndExtractText(prompt);
+
+                // 如果启用 MCP 且回复包含工具调用，执行工具
+                if ((setup.agent().isEnableMCP() || enableMCP) && assistantResponse != null) {
+                    assistantResponse = handleToolCall(assistantResponse, history, setup.sessionId());
+                }
+            }
+        } catch (Exception e) {
+            // 调用失败：回滚刚记入的用户消息，避免历史中残留无回复的脏数据导致后续轮次错乱
+            history.remove(setup.userEntry());
+            if (e instanceof IllegalArgumentException) {
+                throw e;
+            }
+            String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            throw new IllegalStateException("AI 服务调用失败，请稍后重试: " + detail, e);
+        }
+
+        // 将 AI 回复记入会话历史（RAG 分支也统一记录，保证多轮上下文与历史回显一致）
+        history.add(new HistoryEntry("assistant", assistantResponse, List.of()));
+
+        log.info("会话 {} AI 回复: {}", setup.sessionId(), assistantResponse);
+
+        // 计算对话轮数（排除系统消息）
+        int conversationRound = (history.size() - 1) / 2;
+
+        return ChatResponse.builder()
+                .sessionId(setup.sessionId())
+                .message(assistantResponse)
+                .conversationRound(conversationRound)
+                .welcomeMessage(setup.newSession() ? setup.agent().getWelcomeMessage() : null)
+                .agentId(setup.agentId())
+                .build();
+    }
+
+    /**
+     * 处理用户消息并流式返回（chat 的流式变体）：
+     * 复用既有的 Prompt 构建、附件注入、RAG 分支与会话历史管理逻辑，仅把阻塞式模型调用替换为流式调用。
+     * 校验类错误（空白消息、附件策略、RAG 检索失败等）在 SSE 响应提交前同步抛出，
+     * 仍走全局异常处理器返回 HTTP 错误码；流式过程中的错误在流内以 error 事件表达。
+     *
+     * @param sessionId 会话ID，如果为空则创建新会话
+     * @param userMessage 用户消息
+     * @param fileIds 附件 fileId 列表（可选）
+     * @param knowledgeBaseId 知识库ID，可为空
+     * @param enableMCP 是否启用 MCP 工具
+     * @param agentId Agent ID，可为空
+     * @return ChatStreamEvent 事件流（delta/done/error 等，见 ChatStreamEvent）
+     */
+    public Flux<ChatStreamEvent> chatStream(String sessionId, String userMessage, List<String> fileIds,
+                                            String knowledgeBaseId, boolean enableMCP, String agentId) {
+        ConversationSetup setup = prepareConversation(sessionId, userMessage, fileIds, agentId, enableMCP);
+        List<HistoryEntry> history = setup.history();
+
+        // 流式收尾上下文：负责历史写入、回滚与流内 error 事件
+        StreamContext ctx = new StreamContext(setup.sessionId(), setup.agentId(), setup.newSession(),
+                setup.agent().getWelcomeMessage(), history, setup.userEntry());
+
+        // 如果指定了知识库，使用 RAG 流式变体（检索逻辑不变，回答逐段下发）
+        if (knowledgeBaseId != null && !knowledgeBaseId.isEmpty()) {
+            log.info("使用知识库: {} [流式]", knowledgeBaseId);
+            Flux<org.springframework.ai.chat.model.ChatResponse> ragStream;
+            try {
+                ragStream = ragService.ragQueryWithKnowledgeBaseStream(userMessage, knowledgeBaseId, 3);
+            } catch (IllegalArgumentException e) {
+                throw e;
+            } catch (Exception e) {
+                // 检索等前置失败：与同步链路一致回滚用户消息后抛出，走 HTTP 错误语义
+                history.remove(setup.userEntry());
+                String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                throw new IllegalStateException("AI 服务调用失败，请稍后重试: " + detail, e);
+            }
+            return guarded(ragStream, ctx, new StringBuilder());
+        }
+
+        log.info("会话 {} 收到用户消息: {} (附件 {} 个) [流式]", setup.sessionId(), userMessage, setup.attachments().size());
+
+        // MCP 工具调用走"缓冲-检测-二次流式下发"模式，其余直通流式（增量实时下发）
+        boolean useMCP = setup.agent().isEnableMCP() || enableMCP;
+        if (!useMCP) {
+            return guarded(chatModel.stream(new Prompt(buildMessages(history))), ctx, new StringBuilder());
+        }
+
+        // MCP 流式：先缓冲第一轮完整输出 → 沿用既有 JSON 协议检测工具调用
+        // （检测到工具调用时用户会先等第一轮缓冲完成，属接受的体验折衷）
+        StringBuilder buffered = new StringBuilder();
+        StringBuilder content = new StringBuilder();
+        return Flux.concat(
+                chatModel.stream(new Prompt(buildMessages(history)))
+                        .concatMap(chunk -> bufferChunkEvents(chunk, buffered))
+                        .onErrorResume(e -> Flux.just(ctx.fail(e))),
+                Flux.defer(() -> afterMcpFirstRound(buffered.toString(), ctx, content))
+        ).doFinally(signal -> {
+            if (signal == SignalType.CANCEL) {
+                ctx.rollback();
+            }
+        });
+    }
+
+    /**
+     * 为模型流包裹统一的收尾语义：
+     * 思考增量 → thinking 事件、正文增量 → delta 事件；异常 → 回滚 + error 事件；
+     * 完成 → 历史写入 + done 事件；客户端中断（cancel）→ 回滚，且随订阅取消释放上游模型流资源。
+     * content 为正文累积器（MCP 二次调用需跨段共享）
+     */
+    private Flux<ChatStreamEvent> guarded(Flux<org.springframework.ai.chat.model.ChatResponse> modelStream,
+                                          StreamContext ctx, StringBuilder content) {
+        return Flux.concat(
+                modelStream
+                        .concatMap(chunk -> chunkEvents(chunk, content))
+                        .onErrorResume(e -> Flux.just(ctx.fail(e))),
+                Mono.fromSupplier(() -> ctx.complete(content))
+        ).doFinally(signal -> {
+            if (signal == SignalType.CANCEL) {
+                ctx.rollback();
+            }
+        });
+    }
+
+    /**
+     * 单个流式增量 → 事件列表：思考增量先于正文增量，空白思考增量跳过；
+     * 正文增量同时累积进 content
+     */
+    private Flux<ChatStreamEvent> chunkEvents(org.springframework.ai.chat.model.ChatResponse chunk,
+                                              StringBuilder content) {
+        String thinking = extractChunkThinking(chunk);
+        String text = extractChunkText(chunk);
+        if (text != null && !text.isEmpty()) {
+            content.append(text);
+        }
+        if (thinking == null || thinking.isEmpty()) {
+            return text != null && !text.isEmpty() ? Flux.just(deltaEvent(text)) : Flux.empty();
+        }
+        if (text != null && !text.isEmpty()) {
+            return Flux.just(thinkingEvent(thinking), deltaEvent(text));
+        }
+        return Flux.just(thinkingEvent(thinking));
+    }
+
+    /**
+     * MCP 第一轮缓冲：思考增量实时下发，正文增量只写入缓冲区（缓冲完成后统一检测工具调用）
+     */
+    private Flux<ChatStreamEvent> bufferChunkEvents(org.springframework.ai.chat.model.ChatResponse chunk,
+                                                    StringBuilder buffer) {
+        String thinking = extractChunkThinking(chunk);
+        String text = extractChunkText(chunk);
+        if (text != null && !text.isEmpty()) {
+            buffer.append(text);
+        }
+        return thinking != null && !thinking.isEmpty() ? Flux.just(thinkingEvent(thinking)) : Flux.empty();
+    }
+
+    /**
+     * MCP 第一轮缓冲完成后的处理：
+     * 空缓冲 → 沿用"空白回复不入历史"语义（error 事件）；
+     * 检测到工具调用 → tool_call/tool_result 事件，工具结果回喂后二次模型调用改为流式下发；
+     * 未检测到 → 缓冲内容整体作为 delta 下发（有工具调用时用户先等第一轮缓冲完成，属接受的体验折衷）
+     */
+    private Flux<ChatStreamEvent> afterMcpFirstRound(String bufferedText, StreamContext ctx, StringBuilder content) {
+        if (bufferedText.isBlank()) {
+            ctx.rollback();
+            return Flux.just(errorEvent("AI 模型返回了空白回复"));
+        }
+
+        ParsedToolCall toolCall = detectToolCall(bufferedText);
+        if (toolCall == null) {
+            content.append(bufferedText);
+            return Flux.concat(
+                    Flux.just(deltaEvent(bufferedText)),
+                    Mono.fromSupplier(() -> ctx.complete(content)));
+        }
+
+        return Flux.defer(() -> {
+            MCPTool tool = findTool(toolCall.toolName());
+            if (tool == null) {
+                // 工具不存在：沿用同步链路语义，以中文提示作为最终回复，不中断流
+                String tip = "抱歉，找不到名为 '" + toolCall.toolName() + "' 的工具。";
+                content.append(tip);
+                return Flux.concat(
+                        Flux.just(deltaEvent(tip)),
+                        Mono.fromSupplier(() -> ctx.complete(content)));
+            }
+
+            log.info("检测到工具调用: {}", toolCall.toolName());
+            ChatStreamEvent callEvent = ChatStreamEvent.builder()
+                    .type(ChatStreamEvent.TYPE_TOOL_CALL)
+                    .tool(toolCall.toolName())
+                    .arguments(toolCall.arguments())
+                    .build();
+
+            return Flux.concat(
+                    Flux.just(callEvent),
+                    Mono.fromCallable(() -> {
+                        Object result = mcpClientService.callTool(tool.getServerId(), toolCall.toolName(),
+                                toolCall.arguments() != null ? toolCall.arguments() : Map.of());
+                        log.info("工具执行结果: {}", result);
+                        // 工具结果回喂给 AI（沿用同步链路的回喂格式与历史记录）
+                        ctx.history().add(new HistoryEntry("user", String.format(
+                                "工具 %s 执行完毕，结果：%s", toolCall.toolName(), gson.toJson(result)), List.of()));
+                        return result;
+                    }).map(result -> ChatStreamEvent.builder()
+                            .type(ChatStreamEvent.TYPE_TOOL_RESULT)
+                            .tool(toolCall.toolName())
+                            .result(result)
+                            .build()),
+                    // 二次模型调用改为流式下发（delta/thinking/done）
+                    Flux.defer(() -> guarded(chatModel.stream(new Prompt(buildMessages(ctx.history()))), ctx, content))
+            );
+        }).onErrorResume(e -> {
+            // 工具执行等失败：沿用同步链路语义，把第一轮缓冲内容按普通文本下发，不中断流
+            log.error("处理工具调用失败", e);
+            content.append(bufferedText);
+            return Flux.concat(
+                    Flux.just(deltaEvent(bufferedText)),
+                    Mono.fromSupplier(() -> ctx.complete(content)));
+        });
+    }
+
+    /**
+     * 提取流式增量中的正文文本（无输出的元数据块返回 null，由调用方跳过）
+     */
+    private String extractChunkText(org.springframework.ai.chat.model.ChatResponse response) {
+        if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+            return null;
+        }
+        return response.getResult().getOutput().getText();
+    }
+
+    /**
+     * 提取流式增量中的深度思考文本（智谱思考模型）：
+     * 智谱原生模型放在 ZhiPuAiAssistantMessage 的专用字段上；
+     * OpenAI 兼容等通用路径则位于增量元数据的 reasoningContent 键。两条路径都尝试
+     */
+    private String extractChunkThinking(org.springframework.ai.chat.model.ChatResponse response) {
+        if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+            return null;
+        }
+        org.springframework.ai.chat.messages.AssistantMessage output = response.getResult().getOutput();
+        if (output instanceof org.springframework.ai.zhipuai.ZhiPuAiAssistantMessage zhiPuMessage) {
+            String reasoning = zhiPuMessage.getReasoningContent();
+            if (reasoning != null && !reasoning.isEmpty()) {
+                return reasoning;
+            }
+        }
+        Object reasoning = output.getMetadata().get("reasoningContent");
+        if (reasoning == null) {
+            return null;
+        }
+        String text = String.valueOf(reasoning);
+        return text.isEmpty() ? null : text;
+    }
+
+    private ChatStreamEvent deltaEvent(String text) {
+        return ChatStreamEvent.builder()
+                .type(ChatStreamEvent.TYPE_DELTA)
+                .content(text)
+                .build();
+    }
+
+    private ChatStreamEvent thinkingEvent(String text) {
+        return ChatStreamEvent.builder()
+                .type(ChatStreamEvent.TYPE_THINKING)
+                .content(text)
+                .build();
+    }
+
+    private ChatStreamEvent errorEvent(String message) {
+        return ChatStreamEvent.builder()
+                .type(ChatStreamEvent.TYPE_ERROR)
+                .error(message)
+                .build();
+    }
+
+    /**
+     * 对话前置公共流程（chat 与 chatStream 共用，保证两条链路会话语义一致）：
+     * 会话/Agent 解析 → 附件校验 → 会话历史初始化（系统提示词与工具信息）→ 用户消息登记
+     * 校验失败在响应生成前同步抛出，由调用方/全局异常处理器处理
+     */
+    private ConversationSetup prepareConversation(String sessionId, String userMessage, List<String> fileIds,
+                                                  String agentId, boolean enableMCP) {
         // 如果没有 sessionId，创建新会话
         if (sessionId == null || sessionId.isEmpty()) {
             sessionId = UUID.randomUUID().toString();
@@ -166,49 +552,8 @@ public class ConversationAgentService {
                 chatAttachments.stream().map(Attachment::getFileId).collect(Collectors.toList()));
         history.add(userEntry);
 
-        // 如果指定了知识库，使用 RAG
-        String assistantResponse;
-        try {
-            if (knowledgeBaseId != null && !knowledgeBaseId.isEmpty()) {
-                log.info("使用知识库: {}", knowledgeBaseId);
-                assistantResponse = ragService.ragQueryWithKnowledgeBase(userMessage, knowledgeBaseId, 3);
-            } else {
-                log.info("会话 {} 收到用户消息: {} (附件 {} 个)", sessionId, userMessage, chatAttachments.size());
-
-                // 由历史条目构建 Prompt（按需重建多模态 Media）并调用 AI 模型
-                Prompt prompt = new Prompt(buildMessages(history));
-                assistantResponse = callModelAndExtractText(prompt);
-
-                // 如果启用 MCP 且回复包含工具调用，执行工具
-                if ((agent.isEnableMCP() || enableMCP) && assistantResponse != null) {
-                    assistantResponse = handleToolCall(assistantResponse, history, sessionId);
-                }
-            }
-        } catch (Exception e) {
-            // 调用失败：回滚刚记入的用户消息，避免历史中残留无回复的脏数据导致后续轮次错乱
-            history.remove(userEntry);
-            if (e instanceof IllegalArgumentException) {
-                throw e;
-            }
-            String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-            throw new IllegalStateException("AI 服务调用失败，请稍后重试: " + detail, e);
-        }
-
-        // 将 AI 回复记入会话历史（RAG 分支也统一记录，保证多轮上下文与历史回显一致）
-        history.add(new HistoryEntry("assistant", assistantResponse, List.of()));
-
-        log.info("会话 {} AI 回复: {}", sessionId, assistantResponse);
-
-        // 计算对话轮数（排除系统消息）
-        int conversationRound = (history.size() - 1) / 2;
-
-        return ChatResponse.builder()
-                .sessionId(sessionId)
-                .message(assistantResponse)
-                .conversationRound(conversationRound)
-                .welcomeMessage(isNewSession ? agent.getWelcomeMessage() : null)
-                .agentId(finalAgentId)
-                .build();
+        return new ConversationSetup(sessionId, finalAgentId, finalAgent, history, userEntry,
+                isNewSession, chatAttachments);
     }
 
     /**
@@ -339,60 +684,79 @@ public class ConversationAgentService {
     }
 
     /**
-     * 处理工具调用
+     * 按既有 JSON 协议从回复文本中解析工具调用：{"tool": "工具名称", "arguments": {...}}
+     * 未检测到、解析失败或缺少工具名时返回 null（与同步链路的检测语义一致）
+     */
+    @SuppressWarnings("unchecked")
+    private ParsedToolCall detectToolCall(String response) {
+        if (response == null || !(response.contains("{\"tool\"") || response.contains("'tool'"))) {
+            return null;
+        }
+        // 提取 JSON 部分
+        int start = response.indexOf('{');
+        int end = response.lastIndexOf('}') + 1;
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        try {
+            Map<String, Object> toolCall = gson.fromJson(response.substring(start, end), Map.class);
+            if (toolCall == null) {
+                return null;
+            }
+            String toolName = (String) toolCall.get("tool");
+            if (toolName == null) {
+                return null;
+            }
+            return new ParsedToolCall(toolName, (Map<String, Object>) toolCall.get("arguments"));
+        } catch (Exception e) {
+            log.warn("工具调用协议解析失败，按普通文本处理: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 解析后的工具调用：工具名与参数
+     */
+    private record ParsedToolCall(String toolName, Map<String, Object> arguments) {
+    }
+
+    /**
+     * 处理工具调用（同步链路）
      */
     private String handleToolCall(String response, List<HistoryEntry> history, String sessionId) {
+        ParsedToolCall toolCall = detectToolCall(response);
+        if (toolCall == null) {
+            return response;
+        }
         try {
-            // 尝试解析 JSON 格式的工具调用
-            if (response.contains("{\"tool\"") || response.contains("'tool'")) {
-                // 提取 JSON 部分
-                int start = response.indexOf('{');
-                int end = response.lastIndexOf('}') + 1;
-                if (start >= 0 && end > start) {
-                    String jsonPart = response.substring(start, end);
+            log.info("检测到工具调用: {}", toolCall.toolName());
 
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> toolCall = gson.fromJson(jsonPart, Map.class);
-                    if (toolCall == null) {
-                        return response;
-                    }
-
-                    String toolName = (String) toolCall.get("tool");
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> arguments = (Map<String, Object>) toolCall.get("arguments");
-
-                    if (toolName != null) {
-                        log.info("检测到工具调用: {}", toolName);
-
-                        // 查找工具
-                        MCPTool tool = findTool(toolName);
-                        if (tool != null) {
-                            // 执行工具
-                            Object result = mcpClientService.callTool(
-                                tool.getServerId(),
-                                toolName,
-                                arguments != null ? arguments : Map.of()
-                            );
-
-                            log.info("工具执行结果: {}", result);
-
-                            // 将工具结果反馈给 AI
-                            String toolResultMessage = String.format(
-                                "工具 %s 执行完毕，结果：%s",
-                                toolName,
-                                gson.toJson(result)
-                            );
-                            history.add(new HistoryEntry("user", toolResultMessage, List.of()));
-
-                            // 再次调用 AI 获取最终回复
-                            Prompt prompt = new Prompt(buildMessages(history));
-                            return callModelAndExtractText(prompt);
-                        } else {
-                            return "抱歉，找不到名为 '" + toolName + "' 的工具。";
-                        }
-                    }
-                }
+            // 查找工具
+            MCPTool tool = findTool(toolCall.toolName());
+            if (tool == null) {
+                return "抱歉，找不到名为 '" + toolCall.toolName() + "' 的工具。";
             }
+
+            // 执行工具
+            Object result = mcpClientService.callTool(
+                tool.getServerId(),
+                toolCall.toolName(),
+                toolCall.arguments() != null ? toolCall.arguments() : Map.of()
+            );
+
+            log.info("工具执行结果: {}", result);
+
+            // 将工具结果反馈给 AI
+            String toolResultMessage = String.format(
+                "工具 %s 执行完毕，结果：%s",
+                toolCall.toolName(),
+                gson.toJson(result)
+            );
+            history.add(new HistoryEntry("user", toolResultMessage, List.of()));
+
+            // 再次调用 AI 获取最终回复
+            Prompt prompt = new Prompt(buildMessages(history));
+            return callModelAndExtractText(prompt);
         } catch (Exception e) {
             log.error("处理工具调用失败", e);
         }

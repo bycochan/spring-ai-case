@@ -1,7 +1,10 @@
 package com.tes.springai.service;
 
 import com.tes.springai.model.Agent;
+import com.tes.springai.model.ChatMessage;
 import com.tes.springai.model.ChatResponse;
+import com.tes.springai.model.ChatStreamEvent;
+import com.tes.springai.model.mcp.MCPTool;
 import io.milvus.client.MilvusServiceClient;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,12 +17,18 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import reactor.core.publisher.Flux;
 
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
@@ -284,6 +293,289 @@ class ConversationAgentServiceTest {
         String userText = lastUserText(captor.getValue());
         assertTrue(userText.contains("scan.pdf"), "占位提示应带文件名，实际为: " + userText);
         assertTrue(userText.contains("提取失败"), "无文本层 PDF 应以占位提示降级，实际为: " + userText);
+    }
+
+    // ---------- 流式链路（见 docs/specs/chat-streaming-output.md） ----------
+
+    @Test
+    void testStreamSingleRoundEmitsDeltasThenDone() {
+        stubStreamReply("你好", "！", "我是流式助手");
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(null, "你好", null, null, false, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        // 增量事件按序到达且拼接完整
+        assertNotNull(events);
+        List<ChatStreamEvent> deltas = events.stream()
+                .filter(e -> ChatStreamEvent.TYPE_DELTA.equals(e.getType()))
+                .collect(java.util.stream.Collectors.toList());
+        assertEquals(3, deltas.size());
+        String joined = deltas.stream().map(ChatStreamEvent::getContent).collect(java.util.stream.Collectors.joining());
+        assertEquals("你好！我是流式助手", joined);
+
+        // 最后一条为 done，携带会话元数据
+        ChatStreamEvent done = events.get(events.size() - 1);
+        assertEquals(ChatStreamEvent.TYPE_DONE, done.getType());
+        assertNotNull(done.getSessionId());
+        assertEquals(1, done.getConversationRound());
+        assertEquals("default", done.getAgentId());
+        assertEquals("你好！我是你的智能助手，有什么可以帮助你的吗？", done.getWelcomeMessage());
+
+        // 流正常结束后用户与助手消息均写入会话历史
+        List<ChatMessage> history = conversationAgentService.getSessionHistory(done.getSessionId());
+        assertTrue(history.stream().anyMatch(m -> "assistant".equals(m.getRole())));
+        assertTrue(history.stream().anyMatch(m -> "user".equals(m.getRole())));
+    }
+
+    @Test
+    void testStreamBlankReplyEmitsErrorAndSkipsHistory() {
+        String sessionId = "stream-blank-session";
+        stubStreamReply(" ", "\n ");
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(sessionId, "你好", null, null, false, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        // 全文空白：回 error 事件（沿用"空白回复不入历史"语义），不回 done
+        assertNotNull(events);
+        assertEquals(1, events.stream().filter(e -> ChatStreamEvent.TYPE_ERROR.equals(e.getType())).count());
+        assertTrue(events.stream().noneMatch(e -> ChatStreamEvent.TYPE_DONE.equals(e.getType())));
+        assertTrue(events.get(events.size() - 1).getError().contains("空白回复"));
+
+        // 空白回复不入历史：无 assistant 消息，本轮用户消息已回滚
+        List<ChatMessage> history = conversationAgentService.getSessionHistory(sessionId);
+        assertTrue(history.stream().noneMatch(m -> "assistant".equals(m.getRole())));
+        assertTrue(history.stream().noneMatch(m -> "user".equals(m.getRole())));
+    }
+
+    @Test
+    void testStreamModelErrorEmitsErrorEventAndRollsBack() {
+        String sessionId = "stream-error-session";
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.error(new RuntimeException("模型连接超时")));
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(sessionId, "你好", null, null, false, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        assertEquals(1, events.size());
+        assertEquals(ChatStreamEvent.TYPE_ERROR, events.get(0).getType());
+        assertTrue(events.get(0).getError().contains("AI 服务调用失败"));
+
+        // 异常路径不写历史：无 assistant 消息，本轮用户消息已回滚
+        List<ChatMessage> history = conversationAgentService.getSessionHistory(sessionId);
+        assertTrue(history.stream().noneMatch(m -> "assistant".equals(m.getRole())));
+        assertTrue(history.stream().noneMatch(m -> "user".equals(m.getRole())));
+    }
+
+    @Test
+    void testStreamKnowledgeBaseBranchStreamsAnswer() {
+        when(ragService.ragQueryWithKnowledgeBaseStream(anyString(), anyString(), anyInt()))
+                .thenReturn(Flux.just(streamChunk("根据知识库，"), streamChunk("RAG 是检索增强生成。")));
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(null, "什么是RAG", null, "kb-1", false, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        // 知识库分支回答以 delta 流式下发并以 done 收尾
+        assertNotNull(events);
+        String joined = events.stream()
+                .filter(e -> ChatStreamEvent.TYPE_DELTA.equals(e.getType()))
+                .map(ChatStreamEvent::getContent)
+                .collect(java.util.stream.Collectors.joining());
+        assertEquals("根据知识库，RAG 是检索增强生成。", joined);
+        assertEquals(ChatStreamEvent.TYPE_DONE, events.get(events.size() - 1).getType());
+    }
+
+    // ---------- 同步链路 MCP 工具调用（重构回归保障） ----------
+
+    @Test
+    void testSyncToolCallStillExecutesAndFeedsBack() {
+        String sessionId = "sync-tool-session";
+        MCPTool tool = mcpWeatherTool();
+        when(mcpClientService.getAllTools()).thenReturn(List.of(tool));
+        when(mcpClientService.callTool(eq(tool.getServerId()), eq("get_weather"), any()))
+                .thenReturn(Map.of("city", "北京", "weather", "晴"));
+
+        // 第一次调用返回工具协议 JSON，第二次返回最终回答
+        when(chatModel.call(any(Prompt.class)))
+                .thenReturn(chatCallReply("{\"tool\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}"))
+                .thenReturn(chatCallReply("北京今天晴。"));
+
+        ChatResponse response = conversationAgentService
+                .chat(sessionId, "北京天气如何", null, null, true, null);
+
+        assertEquals("北京今天晴。", response.getMessage());
+        verify(mcpClientService).callTool(eq(tool.getServerId()), eq("get_weather"), any());
+    }
+
+    // ---------- 流式 MCP 工具调用与深度思考（见 docs/specs/chat-streaming-output.md） ----------
+
+    @Test
+    void testStreamMcpToolCallEmitsToolEventsThenFinalAnswer() {
+        String sessionId = "stream-mcp-session";
+        MCPTool tool = mcpWeatherTool();
+        when(mcpClientService.getAllTools()).thenReturn(List.of(tool));
+        when(mcpClientService.callTool(eq(tool.getServerId()), eq("get_weather"), any()))
+                .thenReturn(Map.of("city", "北京", "weather", "晴"));
+
+        // 第一轮缓冲返回工具协议 JSON，第二轮流式返回最终回答
+        when(chatModel.stream(any(Prompt.class)))
+                .thenReturn(Flux.just(streamChunk("{\"tool\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}")))
+                .thenReturn(Flux.just(streamChunk("北京今天"), streamChunk("晴。")));
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(sessionId, "北京天气如何", null, null, true, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        assertNotNull(events);
+        List<String> types = events.stream()
+                .map(ChatStreamEvent::getType)
+                .collect(java.util.stream.Collectors.toList());
+
+        // 事件序列：tool_call → tool_result → delta… → done
+        int callIdx = types.indexOf(ChatStreamEvent.TYPE_TOOL_CALL);
+        int resultIdx = types.indexOf(ChatStreamEvent.TYPE_TOOL_RESULT);
+        int deltaIdx = types.indexOf(ChatStreamEvent.TYPE_DELTA);
+        assertTrue(callIdx >= 0, "应包含 tool_call 事件: " + types);
+        assertTrue(resultIdx > callIdx, "tool_result 应在 tool_call 之后: " + types);
+        assertTrue(deltaIdx > resultIdx, "最终回答的 delta 应在工具事件之后: " + types);
+        assertEquals(ChatStreamEvent.TYPE_DONE, types.get(types.size() - 1));
+
+        ChatStreamEvent toolCall = events.get(callIdx);
+        assertEquals("get_weather", toolCall.getTool());
+        assertEquals(Map.of("city", "北京"), toolCall.getArguments());
+
+        ChatStreamEvent toolResult = events.get(resultIdx);
+        assertEquals("get_weather", toolResult.getTool());
+        assertEquals(Map.of("city", "北京", "weather", "晴"), toolResult.getResult());
+
+        // 最终回答仍流式输出
+        String joined = events.stream()
+                .filter(e -> ChatStreamEvent.TYPE_DELTA.equals(e.getType()))
+                .map(ChatStreamEvent::getContent)
+                .collect(java.util.stream.Collectors.joining());
+        assertEquals("北京今天晴。", joined);
+
+        // 历史包含工具结果回喂条目与最终回答
+        List<ChatMessage> history = conversationAgentService.getSessionHistory(sessionId);
+        assertTrue(history.stream().anyMatch(m -> "user".equals(m.getRole()) && m.getContent().contains("get_weather")));
+        assertTrue(history.stream().anyMatch(m -> "assistant".equals(m.getRole()) && "北京今天晴。".equals(m.getContent())));
+    }
+
+    @Test
+    void testStreamMcpToolNotFoundDeliversTip() {
+        String sessionId = "stream-mcp-notfound";
+        when(mcpClientService.getAllTools()).thenReturn(List.of());
+
+        when(chatModel.stream(any(Prompt.class)))
+                .thenReturn(Flux.just(streamChunk("{\"tool\": \"unknown_tool\", \"arguments\": {}}")));
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(sessionId, "调用一个不存在的工具", null, null, true, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        assertNotNull(events);
+        // 工具不存在时不发 tool_call 事件，以中文提示作为 delta 下发并正常 done，不中断流
+        assertTrue(events.stream().noneMatch(e -> ChatStreamEvent.TYPE_TOOL_CALL.equals(e.getType())));
+        String joined = events.stream()
+                .filter(e -> ChatStreamEvent.TYPE_DELTA.equals(e.getType()))
+                .map(ChatStreamEvent::getContent)
+                .collect(java.util.stream.Collectors.joining());
+        assertEquals("抱歉，找不到名为 'unknown_tool' 的工具。", joined);
+        assertEquals(ChatStreamEvent.TYPE_DONE, events.get(events.size() - 1).getType());
+    }
+
+    @Test
+    void testStreamThinkingEventsEmittedAndNotInHistory() {
+        String sessionId = "stream-thinking-session";
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.just(
+                thinkingChunk("", "先想一想"),
+                thinkingChunk("北京今天晴", "再检查一下"),
+                streamChunk("。")));
+
+        List<ChatStreamEvent> events = conversationAgentService
+                .chatStream(sessionId, "北京天气", null, null, false, null)
+                .collectList()
+                .block(Duration.ofSeconds(5));
+
+        assertNotNull(events);
+        // 思考增量以 thinking 事件推送（空白思考增量跳过）
+        List<ChatStreamEvent> thinking = events.stream()
+                .filter(e -> ChatStreamEvent.TYPE_THINKING.equals(e.getType()))
+                .collect(java.util.stream.Collectors.toList());
+        assertEquals(2, thinking.size());
+        assertEquals("先想一想", thinking.get(0).getContent());
+        assertEquals("再检查一下", thinking.get(1).getContent());
+
+        // 正文增量完整拼接
+        String joined = events.stream()
+                .filter(e -> ChatStreamEvent.TYPE_DELTA.equals(e.getType()))
+                .map(ChatStreamEvent::getContent)
+                .collect(java.util.stream.Collectors.joining());
+        assertEquals("北京今天晴。", joined);
+
+        // 思考内容不写入会话历史（多轮上下文仍只含正文）
+        List<ChatMessage> history = conversationAgentService.getSessionHistory(sessionId);
+        String assistantContent = history.stream()
+                .filter(m -> "assistant".equals(m.getRole()))
+                .map(ChatMessage::getContent)
+                .collect(java.util.stream.Collectors.joining());
+        assertEquals("北京今天晴。", assistantContent);
+    }
+
+    /**
+     * 桩定流式模型回复：每个元素作为一个增量块
+     */
+    private void stubStreamReply(String... chunks) {
+        List<org.springframework.ai.chat.model.ChatResponse> responses = Arrays.stream(chunks)
+                .map(this::streamChunk)
+                .collect(java.util.stream.Collectors.toList());
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.fromIterable(responses));
+    }
+
+    /**
+     * 构造单条流式增量响应
+     */
+    private org.springframework.ai.chat.model.ChatResponse streamChunk(String text) {
+        return new org.springframework.ai.chat.model.ChatResponse(
+                List.of(new Generation(new AssistantMessage(text))));
+    }
+
+    /**
+     * 构造携带深度思考元数据的流式增量响应（reasoningContent 字段）
+     */
+    private org.springframework.ai.chat.model.ChatResponse thinkingChunk(String text, String thinking) {
+        AssistantMessage message = AssistantMessage.builder()
+                .content(text)
+                .properties(Map.of("reasoningContent", thinking))
+                .build();
+        return new org.springframework.ai.chat.model.ChatResponse(List.of(new Generation(message)));
+    }
+
+    /**
+     * 构造同步链路单次模型响应
+     */
+    private org.springframework.ai.chat.model.ChatResponse chatCallReply(String text) {
+        return new org.springframework.ai.chat.model.ChatResponse(
+                List.of(new Generation(new AssistantMessage(text))));
+    }
+
+    /**
+     * 测试用 MCP 天气工具
+     */
+    private MCPTool mcpWeatherTool() {
+        return MCPTool.builder()
+                .name("get_weather")
+                .description("查询城市天气")
+                .serverId("server-1")
+                .build();
     }
 
     /**

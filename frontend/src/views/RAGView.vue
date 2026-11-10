@@ -119,23 +119,20 @@
                 {{ msg.role === 'user' ? '👤' : '🤖' }}
               </a-avatar>
               <div class="message-bubble">
-                <div class="message-text">{{ msg.content }}</div>
+                <div class="message-text" v-if="msg.role === 'user'">{{ msg.content }}</div>
+                <template v-else>
+                  <ThinkingBlock :thinking="msg.thinking" :streaming="!!msg.streaming" />
+                  <div class="message-text">
+                    <span v-if="!msg.content && msg.streaming" class="stream-waiting">
+                      <LoadingOutlined spin /> 正在思考...
+                    </span>
+                    <MarkdownMessage v-else :content="msg.content" :streaming="!!msg.streaming" />
+                  </div>
+                </template>
                 <div class="message-time">
                   <ClockCircleOutlined />
                   {{ formatTime(msg.timestamp) }}
                 </div>
-              </div>
-            </div>
-
-            <div v-if="isLoading" class="message-item assistant">
-              <a-avatar :size="40" class="message-avatar">🤖</a-avatar>
-              <div class="message-bubble">
-                <a-spin>
-                  <template #indicator>
-                    <LoadingOutlined style="font-size: 24px" spin />
-                  </template>
-                </a-spin>
-                <span style="margin-left: 12px">搜索中...</span>
               </div>
             </div>
           </div>
@@ -150,15 +147,25 @@
               class="message-input"
             />
             <a-button
+              v-if="isLoading"
+              danger
+              size="large"
+              @click="stopStream"
+              class="send-button"
+            >
+              <template #icon><PauseCircleOutlined /></template>
+              停止生成
+            </a-button>
+            <a-button
+              v-else
               type="primary"
               size="large"
               @click="sendMessage"
-              :disabled="!inputMessage.trim() || isLoading || !currentKB"
-              :loading="isLoading"
+              :disabled="!inputMessage.trim() || !currentKB"
               class="send-button"
             >
               <template #icon><SendOutlined /></template>
-              {{ isLoading ? '搜索中...' : '测试' }}
+              发送
             </a-button>
           </div>
         </a-card>
@@ -200,10 +207,14 @@ import {
   LoadingOutlined,
   InboxOutlined,
   FileTextOutlined,
-  FolderOutlined
+  FolderOutlined,
+  PauseCircleOutlined
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import { chatApi, ragApi } from '../api'
+import { useChatStream } from '../composables/useChatStream'
+import MarkdownMessage from '../components/MarkdownMessage.vue'
+import ThinkingBlock from '../components/ThinkingBlock.vue'
 
 const knowledgeBases = ref([])
 const currentKB = ref(null)
@@ -217,6 +228,8 @@ const showCreateModal = ref(false)
 const newKB = ref({ name: '', description: '' })
 
 const uploadProgress = ref(0)
+
+const { start: startStream, stop: stopStream } = useChatStream()
 
 // 生成会话ID
 const generateSessionId = () => {
@@ -355,7 +368,7 @@ const handleEnter = (e) => {
   }
 }
 
-// 发送消息
+// 发送消息（流式）：先建空助手消息，事件增量追加，打字机模式
 const sendMessage = async () => {
   if (!inputMessage.value.trim() || isLoading.value || !currentKB.value) return
 
@@ -371,30 +384,46 @@ const sendMessage = async () => {
   scrollToBottom()
   isLoading.value = true
 
+  // 先建空助手消息，流式增量直接写入该对象
+  const assistantMsg = {
+    role: 'assistant',
+    content: '',
+    thinking: '',
+    streaming: true,
+    timestamp: Date.now()
+  }
+  chatMessages.value.push(assistantMsg)
+  scrollToBottom()
+
   try {
-    const response = await chatApi.sendMessage(sessionId.value, userMessage, currentKB.value.id)
-    const data = response.data
+    const meta = await startStream(
+      {
+        sessionId: sessionId.value,
+        message: userMessage,
+        knowledgeBaseId: currentKB.value.id,
+        enableMCP: false,
+        agentId: null,
+        fileIds: []
+      },
+      assistantMsg,
+      { onUpdate: scrollToBottom }
+    )
 
-    if (data.sessionId) {
-      sessionId.value = data.sessionId
+    if (meta?.sessionId) {
+      sessionId.value = meta.sessionId
     }
-
-    chatMessages.value.push({
-      role: 'assistant',
-      content: data.message,
-      timestamp: Date.now()
-    })
-
-    scrollToBottom()
   } catch (error) {
     console.error('发送消息失败:', error)
-    chatMessages.value.push({
-      role: 'assistant',
-      content: '抱歉，发送消息时出现错误: ' + (error.response?.data?.error || error.message),
-      timestamp: Date.now()
-    })
+    const errorText = '抱歉，' + (error.message || '发送消息时出现错误，请稍后重试')
+    if (assistantMsg.content) {
+      // 已有部分内容：保留并标注可能不完整
+      assistantMsg.content += '\n\n*（回复生成中断，以上内容可能不完整）*'
+    } else {
+      assistantMsg.content = errorText
+    }
   } finally {
     isLoading.value = false
+    assistantMsg.streaming = false
   }
 }
 
@@ -772,6 +801,14 @@ onMounted(() => {
   border: none;
   border-radius: 20px 20px 4px 20px;
   box-shadow: 0 4px 16px rgba(102, 126, 234, 0.25);
+}
+
+/* 流式等待提示（尚未收到首个增量时） */
+.stream-waiting {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #999;
 }
 
 .message-time {
