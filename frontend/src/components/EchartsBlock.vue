@@ -10,19 +10,30 @@
       </div>
       <pre class="echarts-block__source">{{ source() }}</pre>
     </div>
-    <!-- 流式生成中 / 渲染中 -->
-    <div v-if="!rendered && !failed" class="echarts-block__loading">
+    <!-- 流式拼接中：骨架屏占位（官方"流式自定义代码块"推荐过渡），拼接完成后自动切换真实图表 -->
+    <div v-else-if="isStreaming" class="echarts-block__skeleton">
+      <div class="echarts-block__skeleton-tip">
+        <LoadingOutlined spin />
+        <span>图表数据流式加载中…</span>
+      </div>
+      <a-skeleton :paragraph="{ rows: 5 }" active />
+    </div>
+    <!-- 渲染中（非流式） -->
+    <div v-else-if="!rendered" class="echarts-block__loading">
       <LoadingOutlined spin />
-      <span>{{ isStreaming ? '图表将在回复完成后渲染' : '图表渲染中...' }}</span>
+      <span>图表渲染中...</span>
     </div>
   </div>
 </template>
 
 <script setup>
 // ECharts 代码块渲染组件：经 x-markdown-vue 的 codeXRender 扩展点接管 echarts 语言块，
-// 与 MermaidBlock 同构（流式期间不渲染、失败回退源码、序号守卫防竞态），差异点：
+// 对齐官方 my-echarts 示例（JSON option → echarts.init + setOption + ResizeObserver 自适应）。
+// 行为约定：流式拼接中显示骨架屏（官方"流式自定义代码块"推荐过渡）、失败回退源码展示、序号守卫防竞态；
+// 相比官方示例的增强：
 // - 内容为纯 JSON 的 ECharts option，JSON.parse 直出，不做任何 JS 求值（安全基线同"不解析原始 HTML"）
 // - echarts 需要真实 DOM 与实例生命周期：nextTick 后 init、卸载时 dispose、容器尺寸变化时 resize
+// - option 内容更新时 setOption(notMerge) 全量替换；暗色主题经 init 主题参数生效
 // - 库体积较大，动态 import 控制首包体积
 import { inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { InfoCircleOutlined, LoadingOutlined } from '@ant-design/icons-vue'
@@ -131,7 +142,12 @@ watch(
 
 onMounted(() => {
   // 容器尺寸变化（窗口缩放、侧栏折叠）时自适应重绘
-  resizeObserver = new ResizeObserver(() => chart?.resize())
+  resizeObserver = new ResizeObserver((entries) => {
+    // 容器宽高为 0 时跳过（v-show 隐藏或未完成布局），避免把画布缩成 0 尺寸
+    const rect = entries?.[0]?.contentRect
+    if (!rect || !rect.width || !rect.height) return
+    chart?.resize()
+  })
   if (chartEl.value) resizeObserver.observe(chartEl.value)
 })
 
@@ -164,6 +180,19 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   padding: 16px 12px;
+  color: #8c8c8c;
+  font-size: 13px;
+}
+
+.echarts-block__skeleton {
+  padding: 16px 12px;
+}
+
+.echarts-block__skeleton-tip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
   color: #8c8c8c;
   font-size: 13px;
 }
